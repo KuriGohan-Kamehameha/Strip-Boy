@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 the pip-boy-thor contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This license covers ONLY the original work in this repository — the patcher
+source code, the build scripts, and the documentation. It does NOT grant
+any rights in or to Bethesda Softworks LLC's Fallout 4 Pip-Boy companion
+app, its assets, its native libraries, or any related trademarks. The
+patcher operates on a user-supplied copy of Bethesda's APK and does not
+redistribute Bethesda's code or content.
+
+"Fallout", "Pip-Boy", "Vault-Tec", and related marks are trademarks of
+ZeniMax Media Inc. / Bethesda Softworks LLC. This project is not endorsed
+by or affiliated with ZeniMax or Bethesda in any way.
+
+See README.md and docs/COPYRIGHT.md for the interoperability scope.

@@ -1,0 +1,19 @@
+.DS_Store
+.idea/
+*.iml
+.vscode/
+
+# Bethesda's APK and any derivatives — user-supplied, never committed.
+apk/original.apk
+apk/extracted/
+apk/decompiled/
+apk/managed/
+apk/work/
+apk/out/
+
+# Signing key — generated locally, do not commit (even for debug).
+apk/debug.keystore
+
+# .NET build artifacts
+patcher/bin/
+patcher/obj/

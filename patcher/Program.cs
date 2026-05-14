@@ -1,0 +1,816 @@
+// Strip-Boy patcher — surgical IL edits to Bethesda's Fallout 4 Companion
+// app so it works as a loopback companion on a single Android device
+// (e.g. AYN Thor + GameNative) and behaves cleanly in airplane mode.
+//
+// Three patches, each idempotent:
+//
+//   1. LoopbackDiscovery
+//        SocketDiscoveryChannel.CoreInitialize gains an extra
+//        UDP Send to 127.0.0.1:28000 right after the broadcast Send.
+//        Lets the game's listener (bound 0.0.0.0:28000 inside Wine)
+//        receive the autodiscover probe via loopback.
+//
+//   2. SwrveDisabled
+//        SwrveSettings.IsValid() returns false.
+//        SwrveManager.SendEvent early-returns when IsValid is false,
+//        so the entire Swrve analytics path (POSTs to swrve-content.s3.amazonaws.com)
+//        is short-circuited.
+//
+//   3. HockeyAppDisabled
+//        HockeyAppSettings.IsValid() returns false.
+//        HockeyAppManager.Init disables the iOS+Android crash-report
+//        components when IsValid is false, so HockeyApp WWW POSTs
+//        (rink.hockeyapp.net — Microsoft sunset that service in 2019)
+//        never fire.
+//
+//   4. AutoPickPC
+//        PlatformSelectionMenu.OnFlashReady ends with a call to
+//        OnItemSelected((int)eButtonId.PC), so the selection page
+//        auto-advances as if the PC button was tapped. The page
+//        flashes briefly; we don't suppress the paint, just the wait
+//        for input.
+//
+//   5. SkipWiFiCheck
+//        FlowState.CheckForConnectivity.OnEntering normally fires
+//        WIFIEnabled only if Application.internetReachability == 2
+//        (ReachableViaLocalAreaNetwork), else WIFINotEnabled. That
+//        blocks the loopback path in airplane mode without WiFi.
+//        Patched to unconditionally fire WIFIEnabled. SocketDiscovery
+//        handles a missing LAN interface gracefully.
+//
+//   6. ShieldBroadcastSend
+//        Wraps the broadcast UDP Send in try/catch (Exception). In
+//        full airplane mode (no WiFi at all) the broadcast Send can
+//        throw SocketException "network unreachable". Without this
+//        shield the throw aborts CoreInitialize before the loopback
+//        Send or BeginReceive ever run — so the loopback path stays
+//        dark exactly when we need it. The catch body just swallows.
+//
+//   7. AutoPickLoopback
+//        IPListMenu.SetPossibleConnections scans the discovered
+//        device list; if any entry has IP == "127.0.0.1" and Platform
+//        == PC, it calls OnListItemSelected(idx) immediately. Net
+//        effect: as soon as discovery returns a loopback responder,
+//        the app connects without a tap.
+//
+//   8. RewriteNoConsoleFoundDesc
+//        FontConfigManager.GetText, given the key
+//        "$Companion_NoConsoleFoundDesc", returns a GameNative-aware
+//        message instead of Bethesda's "check your Fallout 4 Gameplay
+//        Settings" text. All other keys fall through unchanged.
+//
+//   9. AutoPickFullscreenDisplayMode
+//        DisplayModeSelectionMenu.OnFlashReady gains a call to
+//        OnItemSelected(1) — same shape as patch #4 — which is the
+//        "Fullscreen" enum value. Bypasses the one-time
+//        "Hardware vs Fullscreen" prompt on first launch. Hardware
+//        mode is for the physical Pip-Boy wrist-holder accessory
+//        that Bethesda shipped; not relevant on a handheld's flat
+//        bottom screen.
+//
+// Nothing else is touched. UI, audio, in-game protocol, asset loading,
+// localisation, debug menu — all byte-identical to Bethesda's release.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+
+if (args.Length != 2)
+{
+    Console.Error.WriteLine("usage: pipboy-patcher <input.dll> <output.dll>");
+    return 2;
+}
+
+var input = args[0];
+var output = args[1];
+
+if (!File.Exists(input))
+{
+    Console.Error.WriteLine($"Input not found: {input}");
+    return 2;
+}
+
+var resolver = new DefaultAssemblyResolver();
+resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(input))!);
+
+var readerParams = new ReaderParameters
+{
+    AssemblyResolver = resolver,
+    ReadWrite = false,
+    InMemory = true,
+};
+
+using var asm = AssemblyDefinition.ReadAssembly(input, readerParams);
+var module = asm.MainModule;
+
+var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
+{
+    ("LoopbackDiscovery",  LoopbackDiscovery.Apply),
+    ("SwrveDisabled",      m => IsValidNeutralizer.ApplyToType(m, "SwrveSettings")),
+    ("HockeyAppDisabled",  m => IsValidNeutralizer.ApplyToType(m, "HockeyAppSettings")),
+    ("AutoPickPC",                AutoPickPC.Apply),
+    ("SkipWiFiCheck",             SkipWiFiCheck.Apply),
+    ("ShieldBroadcastSend",       ShieldBroadcastSend.Apply),
+    ("AutoPickLoopback",          AutoPickLoopback.Apply),
+    ("RewriteNoConsoleFoundDesc", RewriteNoConsoleFoundDesc.Apply),
+    ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
+};
+
+var anyChanged = false;
+foreach (var (name, apply) in patches)
+{
+    try
+    {
+        var result = apply(module);
+        Console.WriteLine($"[{(result.Changed ? "patch" : "skip ")}] {name}: {result.Message}");
+        anyChanged |= result.Changed;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[FAIL ] {name}: {ex.Message}");
+        return 1;
+    }
+}
+
+if (!anyChanged)
+{
+    Console.WriteLine("All patches already applied. Copying input to output unchanged.");
+}
+
+asm.Write(output);
+Console.WriteLine($"Wrote {output}");
+return 0;
+
+
+/* ===================================================================== */
+
+readonly record struct PatchResult(bool Changed, string Message);
+
+static class LoopbackDiscovery
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("SocketDiscoveryChannel")
+            ?? throw new Exception("SocketDiscoveryChannel type not found");
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == "CoreInitialize")
+            ?? throw new Exception("SocketDiscoveryChannel::CoreInitialize not found");
+
+        var discoverySocketField = type.Fields.FirstOrDefault(f => f.Name == "_discoverySocket")
+            ?? throw new Exception("_discoverySocket field not found");
+
+        // Steal existing references from the method body so signatures match
+        // the exact runtime assemblies this DLL was compiled against.
+        FieldReference? broadcastFieldRef = null;
+        MethodReference? ipEndPointCtorRef = null;
+        MethodReference? sendMethodRef = null;
+
+        foreach (var ins in method.Body.Instructions)
+        {
+            if (ins.OpCode == OpCodes.Ldsfld && ins.Operand is FieldReference fr
+                && fr.Name == "Broadcast" && fr.DeclaringType.Name == "IPAddress")
+                broadcastFieldRef = fr;
+            else if (ins.OpCode == OpCodes.Newobj && ins.Operand is MethodReference ctor
+                && ctor.DeclaringType.Name == "IPEndPoint" && ctor.Name == ".ctor")
+                ipEndPointCtorRef = ctor;
+            else if (ins.OpCode == OpCodes.Callvirt && ins.Operand is MethodReference call
+                && call.DeclaringType.Name == "UdpClient" && call.Name == "Send"
+                && call.Parameters.Count == 3)
+                sendMethodRef = call;
+        }
+
+        if (broadcastFieldRef == null) throw new Exception("Couldn't find IPAddress.Broadcast ref");
+        if (ipEndPointCtorRef == null) throw new Exception("Couldn't find IPEndPoint::.ctor ref");
+        if (sendMethodRef == null) throw new Exception("Couldn't find UdpClient::Send(3-arg) ref");
+
+        var loopbackFieldRef = new FieldReference(
+            "Loopback",
+            broadcastFieldRef.FieldType,
+            broadcastFieldRef.DeclaringType);
+
+        // Find insertion point: the first (Callvirt Send) + Pop pair.
+        Instruction? insertAfter = null;
+        var ins0 = method.Body.Instructions;
+        for (var i = 0; i < ins0.Count - 1; i++)
+        {
+            if (ins0[i].OpCode == OpCodes.Callvirt
+                && ins0[i].Operand is MethodReference mr
+                && mr.DeclaringType.Name == "UdpClient" && mr.Name == "Send"
+                && ins0[i + 1].OpCode == OpCodes.Pop)
+            {
+                insertAfter = ins0[i + 1];
+                break;
+            }
+        }
+        if (insertAfter == null) throw new Exception("Couldn't find existing Send+Pop pair");
+
+        // Idempotence: if the next instructions match our injection, skip.
+        if (LooksAlreadyPatched(insertAfter))
+            return new(false, "already patched");
+
+        var il = method.Body.GetILProcessor();
+        var toInsert = new[]
+        {
+            il.Create(OpCodes.Ldarg_0),
+            il.Create(OpCodes.Ldfld, discoverySocketField),
+            il.Create(OpCodes.Ldloc_1),                           // bytes
+            il.Create(OpCodes.Ldloc_1),
+            il.Create(OpCodes.Ldlen),
+            il.Create(OpCodes.Conv_I4),                           // bytes.Length
+            il.Create(OpCodes.Ldsfld, loopbackFieldRef),
+            il.Create(OpCodes.Ldc_I4, 28000),
+            il.Create(OpCodes.Newobj, ipEndPointCtorRef),
+            il.Create(OpCodes.Callvirt, sendMethodRef),
+            il.Create(OpCodes.Pop),
+        };
+
+        var anchor = insertAfter;
+        foreach (var newIns in toInsert)
+        {
+            il.InsertAfter(anchor, newIns);
+            anchor = newIns;
+        }
+
+        return new(true, $"inserted {toInsert.Length} IL after IL_{insertAfter.Offset:X4}");
+    }
+
+    static bool LooksAlreadyPatched(Instruction insertAfter)
+    {
+        var probe = insertAfter.Next;
+        for (var i = 0; i < 12 && probe != null; i++)
+        {
+            if (probe.OpCode == OpCodes.Ldsfld
+                && probe.Operand is FieldReference lf
+                && lf.Name == "Loopback")
+                return true;
+            probe = probe.Next;
+        }
+        return false;
+    }
+}
+
+static class IsValidNeutralizer
+{
+    public static PatchResult ApplyToType(ModuleDefinition module, string typeName)
+    {
+        var type = module.GetType(typeName)
+            ?? throw new Exception($"{typeName} type not found");
+        return ReplaceBody(type, "IsValid");
+    }
+
+    // Replace MethodName's body with `return false` (ldc.i4.0; ret).
+    // Idempotent: if the body is already exactly that, no change.
+    public static PatchResult ReplaceBody(TypeDefinition type, string methodName)
+    {
+        var method = type.Methods.FirstOrDefault(m => m.Name == methodName)
+            ?? throw new Exception($"{type.Name}::{methodName} not found");
+
+        if (method.ReturnType.MetadataType != MetadataType.Boolean)
+            throw new Exception($"{type.Name}::{methodName} return type is {method.ReturnType.Name}, expected Boolean");
+
+        var body = method.Body;
+        var ins = body.Instructions;
+
+        if (ins.Count == 2
+            && ins[0].OpCode == OpCodes.Ldc_I4_0
+            && ins[1].OpCode == OpCodes.Ret)
+        {
+            return new(false, $"{type.Name}::{methodName} already returns false");
+        }
+
+        body.ExceptionHandlers.Clear();
+        body.Variables.Clear();
+        ins.Clear();
+
+        var il = body.GetILProcessor();
+        il.Append(il.Create(OpCodes.Ldc_I4_0));
+        il.Append(il.Create(OpCodes.Ret));
+        body.MaxStackSize = 1;
+
+        return new(true, $"{type.Name}::{methodName} body replaced with `return false`");
+    }
+}
+
+static class AutoPickPC
+{
+    public static PatchResult Apply(ModuleDefinition module) =>
+        FlashMenuAutoPicker.Inject(module, "PlatformSelectionMenu", 0, "PC");
+}
+
+static class AutoPickFullscreenMode
+{
+    public static PatchResult Apply(ModuleDefinition module) =>
+        FlashMenuAutoPicker.Inject(module, "DisplayModeSelectionMenu", 1, "FullscreenMode");
+}
+
+// Shared body for the AutoPick* patches: append OnItemSelected(value) to the
+// end of OnFlashReady on the given Scaleform menu type. Re-uses the menu's
+// own OnItemSelected (so we mimic the exact button-tap code path).
+static class FlashMenuAutoPicker
+{
+    public static PatchResult Inject(ModuleDefinition module, string typeName, int itemId, string label)
+    {
+        var type = module.GetType(typeName)
+            ?? throw new Exception($"{typeName} type not found");
+
+        var onReady = type.Methods.FirstOrDefault(m => m.Name == "OnFlashReady")
+            ?? throw new Exception($"{typeName}::OnFlashReady not found");
+        var onItemSelected = type.Methods.FirstOrDefault(m =>
+            m.Name == "OnItemSelected" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.MetadataType == MetadataType.Int32)
+            ?? throw new Exception($"{typeName}::OnItemSelected(int32) not found");
+
+        // Idempotence: if we've already injected a call to OnItemSelected, bail.
+        foreach (var ins in onReady.Body.Instructions)
+        {
+            if ((ins.OpCode == OpCodes.Callvirt || ins.OpCode == OpCodes.Call)
+                && ins.Operand is MethodReference mr
+                && mr.Resolve() == onItemSelected)
+            {
+                return new(false, $"{typeName}::OnFlashReady already auto-picks");
+            }
+        }
+
+        var body = onReady.Body;
+        var instructions = body.Instructions;
+        var lastRet = instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
+            ?? throw new Exception($"{typeName}::OnFlashReady has no ret");
+
+        var il = body.GetILProcessor();
+        il.InsertBefore(lastRet, il.Create(OpCodes.Ldarg_0));                // this
+        il.InsertBefore(lastRet, OpCodeForIntConstant(il, itemId));          // itemID
+        il.InsertBefore(lastRet, il.Create(OpCodes.Callvirt, onItemSelected));
+
+        return new(true, $"{typeName}::OnFlashReady now auto-calls OnItemSelected({itemId}={label})");
+    }
+
+    static Instruction OpCodeForIntConstant(ILProcessor il, int v) => v switch
+    {
+        0 => il.Create(OpCodes.Ldc_I4_0),
+        1 => il.Create(OpCodes.Ldc_I4_1),
+        2 => il.Create(OpCodes.Ldc_I4_2),
+        3 => il.Create(OpCodes.Ldc_I4_3),
+        _ => il.Create(OpCodes.Ldc_I4, v),
+    };
+}
+
+static class SkipWiFiCheck
+{
+    // Find the FlowState lambda whose body uses Application.internetReachability
+    // and fires FlowTrigger.WIFIEnabled / WIFINotEnabled. Replace its body
+    // with: ldsfld FlowTrigger::WIFIEnabled; callvirt Fire(); ret.
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        MethodDefinition? target = null;
+        FieldReference? wifiEnabledField = null;
+        MethodReference? fireMethod = null;
+
+        foreach (var type in module.GetTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                var usesReach = false;
+                FieldReference? localWifiEnabled = null;
+                MethodReference? localFire = null;
+
+                foreach (var ins in method.Body.Instructions)
+                {
+                    if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                        && ins.Operand is MethodReference mr1
+                        && mr1.Name == "get_internetReachability"
+                        && mr1.DeclaringType.Name == "Application")
+                        usesReach = true;
+
+                    if (ins.OpCode == OpCodes.Ldsfld
+                        && ins.Operand is FieldReference fr
+                        && fr.DeclaringType.Name == "FlowTrigger"
+                        && fr.Name == "WIFIEnabled")
+                        localWifiEnabled = fr;
+
+                    if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                        && ins.Operand is MethodReference mr2
+                        && mr2.DeclaringType.Name == "FlowTrigger"
+                        && mr2.Name == "Fire")
+                        localFire = mr2;
+                }
+
+                if (usesReach && localWifiEnabled != null && localFire != null)
+                {
+                    if (target != null)
+                        throw new Exception($"ambiguous: {target.FullName} and {method.FullName} both look like the WiFi gate");
+                    target = method;
+                    wifiEnabledField = localWifiEnabled;
+                    fireMethod = localFire;
+                }
+            }
+        }
+
+        if (target == null)
+        {
+            // Defense in depth: if we can't find the original WiFi-gate
+            // (uses internetReachability AND fires WIFIEnabled/Fire), check
+            // whether some method has the exact 3-instruction body that this
+            // patch produces. If so, we've already patched.
+            foreach (var t in module.GetTypes())
+            {
+                foreach (var m in t.Methods)
+                {
+                    if (!m.HasBody) continue;
+                    var bodyIns = m.Body.Instructions;
+                    if (bodyIns.Count == 3
+                        && bodyIns[0].OpCode == OpCodes.Ldsfld
+                        && bodyIns[0].Operand is FieldReference lf
+                        && lf.DeclaringType.Name == "FlowTrigger" && lf.Name == "WIFIEnabled"
+                        && (bodyIns[1].OpCode == OpCodes.Callvirt || bodyIns[1].OpCode == OpCodes.Call)
+                        && bodyIns[1].Operand is MethodReference lm
+                        && lm.DeclaringType.Name == "FlowTrigger" && lm.Name == "Fire"
+                        && bodyIns[2].OpCode == OpCodes.Ret)
+                    {
+                        return new(false, $"{t.Name}::{m.Name} already unconditionally fires WIFIEnabled");
+                    }
+                }
+            }
+            throw new Exception("Couldn't find WiFi-gate lambda (not original, not patched)");
+        }
+
+        // Idempotence: body is already exactly {Ldsfld WIFIEnabled, Callvirt Fire, Ret}.
+        var body = target.Body;
+        var existing = body.Instructions;
+        if (existing.Count == 3
+            && existing[0].OpCode == OpCodes.Ldsfld
+            && existing[0].Operand is FieldReference ef && ef.Name == "WIFIEnabled"
+            && (existing[1].OpCode == OpCodes.Callvirt || existing[1].OpCode == OpCodes.Call)
+            && existing[2].OpCode == OpCodes.Ret)
+        {
+            return new(false, $"{target.FullName} already unconditionally fires WIFIEnabled");
+        }
+
+        body.ExceptionHandlers.Clear();
+        body.Variables.Clear();
+        existing.Clear();
+
+        var il = body.GetILProcessor();
+        il.Append(il.Create(OpCodes.Ldsfld, wifiEnabledField));
+        il.Append(il.Create(OpCodes.Callvirt, fireMethod));
+        il.Append(il.Create(OpCodes.Ret));
+        body.MaxStackSize = 1;
+
+        return new(true, $"{target.DeclaringType.Name}::{target.Name} body replaced with `WIFIEnabled.Fire()`");
+    }
+}
+
+static class ShieldBroadcastSend
+{
+    // Wrap the existing broadcast UdpClient.Send (the first Send+Pop pair in
+    // SocketDiscoveryChannel.CoreInitialize) in a try/catch(Exception) that
+    // swallows the exception. The pop+leave keeps the stack balanced.
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("SocketDiscoveryChannel")
+            ?? throw new Exception("SocketDiscoveryChannel type not found");
+        var method = type.Methods.FirstOrDefault(m => m.Name == "CoreInitialize")
+            ?? throw new Exception("CoreInitialize not found");
+
+        var body = method.Body;
+        var instructions = body.Instructions;
+
+        // Idempotence: if the method already has an exception handler whose
+        // try block covers a UdpClient.Send, we've already patched.
+        foreach (var eh in body.ExceptionHandlers)
+        {
+            var probe = eh.TryStart;
+            while (probe != null && probe != eh.TryEnd)
+            {
+                if (probe.OpCode == OpCodes.Callvirt
+                    && probe.Operand is MethodReference mr
+                    && mr.Name == "Send" && mr.DeclaringType.Name == "UdpClient")
+                    return new(false, "broadcast Send already shielded");
+                probe = probe.Next;
+            }
+        }
+
+        // Locate the first Send+Pop pair (the broadcast one — appears before
+        // our LoopbackDiscovery injection, which is at the next Send+Pop pair).
+        Instruction? callSend = null;
+        Instruction? popAfter = null;
+        for (var i = 0; i < instructions.Count - 1; i++)
+        {
+            if (instructions[i].OpCode == OpCodes.Callvirt
+                && instructions[i].Operand is MethodReference mr
+                && mr.Name == "Send" && mr.DeclaringType.Name == "UdpClient"
+                && instructions[i + 1].OpCode == OpCodes.Pop)
+            {
+                callSend = instructions[i];
+                popAfter = instructions[i + 1];
+                break;
+            }
+        }
+        if (callSend == null || popAfter == null)
+            throw new Exception("broadcast Send+Pop pair not found");
+
+        // The try block covers the 9-instruction broadcast Send sequence:
+        //   ldarg.0, ldfld _discoverySocket, ldloc.1, ldloc.1, ldlen,
+        //   conv.i4, ldloc.0, callvirt Send, pop
+        // i.e. eight instructions ending at the pop. Walk back 8 from popAfter.
+        var sendStart = popAfter;
+        for (var i = 0; i < 8; i++)
+        {
+            sendStart = sendStart.Previous
+                ?? throw new Exception("walked off the front while locating Send start");
+        }
+        // sendStart should now be the ldarg.0 that begins the broadcast Send sequence.
+        if (sendStart.OpCode != OpCodes.Ldarg_0)
+            throw new Exception($"expected ldarg.0 at start of broadcast Send, got {sendStart.OpCode}");
+
+        // afterTry is the instruction right after the existing pop — that's where
+        // both the try's leave and the catch's leave will jump to.
+        var afterTry = popAfter.Next
+            ?? throw new Exception("no instruction after broadcast Send's pop");
+
+        // System.Exception type reference. Steal one from an EXISTING catch
+        // handler in the assembly so the AssemblyRef matches what Unity Mono
+        // is bound against (importing typeof(Exception) here would bind
+        // against the patcher's mscorlib v4, which Mono rejects with
+        // TypeLoadException at runtime).
+        TypeReference? exceptionTypeRef = null;
+        foreach (var t in module.GetTypes())
+        {
+            foreach (var m in t.Methods)
+            {
+                if (!m.HasBody) continue;
+                foreach (var eh in m.Body.ExceptionHandlers)
+                {
+                    if (eh.HandlerType == ExceptionHandlerType.Catch
+                        && eh.CatchType != null
+                        && eh.CatchType.FullName == "System.Exception")
+                    {
+                        exceptionTypeRef = eh.CatchType;
+                        break;
+                    }
+                }
+                if (exceptionTypeRef != null) break;
+            }
+            if (exceptionTypeRef != null) break;
+        }
+        if (exceptionTypeRef == null)
+            throw new Exception("No existing catch(Exception) site found to steal type reference from");
+
+        var il = body.GetILProcessor();
+
+        // Insert "leave afterTry" right after the pop — this becomes the end
+        // of the try block.
+        var leaveFromTry = il.Create(OpCodes.Leave, afterTry);
+        il.InsertAfter(popAfter, leaveFromTry);
+
+        // Insert the catch body right after the leave: pop the exception, leave.
+        var popException = il.Create(OpCodes.Pop);
+        var leaveFromCatch = il.Create(OpCodes.Leave, afterTry);
+        il.InsertAfter(leaveFromTry, popException);
+        il.InsertAfter(popException, leaveFromCatch);
+
+        body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = sendStart,
+            TryEnd = popException,        // exclusive — first ins of catch
+            HandlerStart = popException,
+            HandlerEnd = afterTry,         // exclusive — first ins after catch
+            CatchType = exceptionTypeRef,
+        });
+
+        return new(true, $"wrapped broadcast Send (IL_{sendStart.Offset:X4}..IL_{popAfter.Offset:X4}) in try/catch");
+    }
+}
+
+static class AutoPickLoopback
+{
+    // At the end of IPListMenu.SetPossibleConnections, scan the freshly-set
+    // _possibleConnections list; if any entry has IP == "127.0.0.1", call
+    // OnListItemSelected(i) and break. Emits a manual for-loop in IL.
+    //
+    // NB: never call .Resolve() on system types (String, Int32, List<T>).
+    // Cecil's default resolver falls back to the patcher's own runtime
+    // (System.Private.CoreLib on .NET 10) when it can't find the target
+    // assembly's mscorlib in the search path. That produces references
+    // scoped to a corlib that doesn't exist at runtime, and the JIT
+    // throws FileNotFoundException when the patched method is invoked.
+    // We construct MethodReferences manually using module.TypeSystem.*
+    // (which is already scoped to the module's CorlibReference, i.e.
+    // Unity Mono's mscorlib).
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("IPListMenu")
+            ?? throw new Exception("IPListMenu type not found");
+
+        var setConn = type.Methods.FirstOrDefault(m =>
+            m.Name == "SetPossibleConnections" && m.Parameters.Count == 1)
+            ?? throw new Exception("IPListMenu::SetPossibleConnections(IEnumerable<RemoteDeviceDescription>) not found");
+
+        var onItemSelected = type.Methods.FirstOrDefault(m =>
+            m.Name == "OnListItemSelected" && m.Parameters.Count == 1
+            && m.Parameters[0].ParameterType.MetadataType == MetadataType.Int32)
+            ?? throw new Exception("IPListMenu::OnListItemSelected(int) not found");
+
+        var possibleConnectionsField = type.Fields.FirstOrDefault(f => f.Name == "_possibleConnections")
+            ?? throw new Exception("_possibleConnections field not found");
+
+        if (possibleConnectionsField.FieldType is not GenericInstanceType listType)
+            throw new Exception("_possibleConnections is not a generic List<>");
+        var elementType = listType.GenericArguments[0]; // RemoteDeviceDescription, same module
+
+        // Avoid List<T>'s generic instance methods entirely — constructing
+        // a MethodReference for a method that returns the open generic T
+        // requires resolving List`1, which would pull in System.Private.CoreLib
+        // via Cecil's resolver fallback. Instead, dispatch through the
+        // non-generic ICollection.get_Count and IList.get_Item — List<T>
+        // implements both, and the references have no generics.
+        var corlibScope = module.TypeSystem.CoreLibrary;
+        var iCollectionType = new TypeReference("System.Collections", "ICollection",
+            module, corlibScope, valueType: false);
+        var iListType = new TypeReference("System.Collections", "IList",
+            module, corlibScope, valueType: false);
+
+        // ICollection.get_Count() -> int
+        var getCount = new MethodReference("get_Count", module.TypeSystem.Int32, iCollectionType)
+            { HasThis = true };
+
+        // IList.get_Item(int) -> object  (we'll castclass RemoteDeviceDescription)
+        var getItem = new MethodReference("get_Item", module.TypeSystem.Object, iListType)
+            { HasThis = true };
+        getItem.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+
+        // RemoteDeviceDescription.get_IP -> string. Custom type in this same
+        // module, fine to construct manually with module's type-system.
+        var getIP = new MethodReference("get_IP", module.TypeSystem.String, elementType)
+            { HasThis = true };
+
+        // String.op_Equality(string, string) -> bool. Static.
+        var stringEquals = new MethodReference("op_Equality", module.TypeSystem.Boolean, module.TypeSystem.String);
+        stringEquals.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        stringEquals.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var body = setConn.Body;
+        var instructions = body.Instructions;
+
+        // Idempotence: if the method already references "127.0.0.1", skip.
+        foreach (var ins in instructions)
+        {
+            if (ins.OpCode == OpCodes.Ldstr && (ins.Operand as string) == "127.0.0.1")
+                return new(false, "IPListMenu::SetPossibleConnections already auto-picks loopback");
+        }
+
+        // We need two local ints: idx and a slot for the current device.
+        // For simplicity use just one int local (idx) and re-fetch the device
+        // each iteration via _possibleConnections[idx].
+        var int32Type = module.TypeSystem.Int32;
+        var idxLocal = new VariableDefinition(int32Type);
+        body.Variables.Add(idxLocal);
+
+        var il = body.GetILProcessor();
+
+        // The original method ends with a ret. Insert our loop before it.
+        var oldRet = instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
+            ?? throw new Exception("SetPossibleConnections has no ret");
+
+        // Build the loop instructions:
+        //   ldc.i4.0; stloc idx
+        // loop:
+        //   ldloc idx
+        //   ldarg.0; ldfld _possibleConnections
+        //   callvirt get_Count
+        //   bge done
+        //   ldarg.0; ldfld _possibleConnections
+        //   ldloc idx
+        //   callvirt get_Item
+        //   callvirt get_IP
+        //   ldstr "127.0.0.1"
+        //   call op_Equality
+        //   brfalse next
+        //   ldarg.0
+        //   ldloc idx
+        //   callvirt OnListItemSelected
+        //   br done
+        // next:
+        //   ldloc idx; ldc.i4.1; add; stloc idx
+        //   br loop
+        // done:
+        //   (ret follows)
+
+        var doneAnchor = oldRet;  // jump here to exit
+        var initIdx0 = il.Create(OpCodes.Ldc_I4_0);
+        var initIdx1 = il.Create(OpCodes.Stloc, idxLocal);
+
+        var loopHead = il.Create(OpCodes.Ldloc, idxLocal);
+        var loadCount0 = il.Create(OpCodes.Ldarg_0);
+        var loadCount1 = il.Create(OpCodes.Ldfld, possibleConnectionsField);
+        var loadCount2 = il.Create(OpCodes.Callvirt, getCount);
+        var bgeDone   = il.Create(OpCodes.Bge, doneAnchor);
+
+        var getItem0 = il.Create(OpCodes.Ldarg_0);
+        var getItem1 = il.Create(OpCodes.Ldfld, possibleConnectionsField);
+        var getItem2 = il.Create(OpCodes.Ldloc, idxLocal);
+        var getItem3 = il.Create(OpCodes.Callvirt, getItem);     // returns object
+        var castDev  = il.Create(OpCodes.Castclass, elementType); // narrow to RemoteDeviceDescription
+        var getIP0   = il.Create(OpCodes.Callvirt, getIP);
+        var ldLiteral = il.Create(OpCodes.Ldstr, "127.0.0.1");
+        var callEq   = il.Create(OpCodes.Call, stringEquals);
+
+        // We need the brfalse target = the "next" iteration label. We'll
+        // build the increment block and use its first instruction as the
+        // jump target.
+        var incIdx0 = il.Create(OpCodes.Ldloc, idxLocal);
+        var incIdx1 = il.Create(OpCodes.Ldc_I4_1);
+        var incIdx2 = il.Create(OpCodes.Add);
+        var incIdx3 = il.Create(OpCodes.Stloc, idxLocal);
+        var jumpBack = il.Create(OpCodes.Br, loopHead);
+
+        var brfalseNext = il.Create(OpCodes.Brfalse, incIdx0);
+
+        var callSelected0 = il.Create(OpCodes.Ldarg_0);
+        var callSelected1 = il.Create(OpCodes.Ldloc, idxLocal);
+        var callSelected2 = il.Create(OpCodes.Callvirt, onItemSelected);
+        var brDone = il.Create(OpCodes.Br, doneAnchor);
+
+        // Now wire them up in order, inserting before the existing ret.
+        var sequence = new[]
+        {
+            initIdx0, initIdx1,
+            loopHead,
+            loadCount0, loadCount1, loadCount2, bgeDone,
+            getItem0, getItem1, getItem2, getItem3, castDev,
+            getIP0, ldLiteral, callEq, brfalseNext,
+            callSelected0, callSelected1, callSelected2, brDone,
+            incIdx0, incIdx1, incIdx2, incIdx3, jumpBack,
+        };
+        foreach (var ins in sequence)
+            il.InsertBefore(oldRet, ins);
+
+        // Ensure max stack is enough (we push up to 2 args + 1 result for OnListItemSelected).
+        if (body.MaxStackSize < 3) body.MaxStackSize = 3;
+
+        return new(true, $"IPListMenu::SetPossibleConnections now auto-calls OnListItemSelected on 127.0.0.1 entry");
+    }
+}
+
+static class RewriteNoConsoleFoundDesc
+{
+    public const string NewMessage =
+        "GameNative must be running Fallout 4 on the top screen, in the foreground. " +
+        "Select the 127.0.0.1 entry; any other addresses can be ignored.";
+
+    // Prepend an early-return to FontConfigManager.GetText:
+    //   if (key == "$Companion_NoConsoleFoundDesc") return <NewMessage>;
+    //   ... original body ...
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("FontConfigManager")
+            ?? throw new Exception("FontConfigManager type not found");
+
+        var method = type.Methods.FirstOrDefault(m =>
+            m.Name == "GetText" && m.Parameters.Count == 1
+            && m.Parameters[0].ParameterType.FullName == "System.String"
+            && m.ReturnType.FullName == "System.String")
+            ?? throw new Exception("FontConfigManager::GetText(string) -> string not found");
+
+        var body = method.Body;
+        var instructions = body.Instructions;
+
+        // Idempotence: if the body already starts with `ldstr <NewMessage>` somewhere
+        // before any callvirt, we're done.
+        foreach (var ins in instructions)
+        {
+            if (ins.OpCode == OpCodes.Ldstr && (ins.Operand as string) == NewMessage)
+                return new(false, "FontConfigManager::GetText already rewritten");
+            if (ins.OpCode == OpCodes.Callvirt || ins.OpCode == OpCodes.Call) break;
+        }
+
+        // String.op_Equality(string, string) -> bool, static.
+        // (See note in AutoPickLoopback for why we don't .Resolve().)
+        var stringEquals = new MethodReference("op_Equality", module.TypeSystem.Boolean, module.TypeSystem.String);
+        stringEquals.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        stringEquals.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var firstOriginal = instructions[0];
+
+        var il = body.GetILProcessor();
+
+        var loadKey      = il.Create(OpCodes.Ldarg_1);
+        var loadCmpKey   = il.Create(OpCodes.Ldstr, "$Companion_NoConsoleFoundDesc");
+        var callEqOp     = il.Create(OpCodes.Call, stringEquals);
+        var brFalseToOrig= il.Create(OpCodes.Brfalse, firstOriginal);
+        var loadNewMsg   = il.Create(OpCodes.Ldstr, NewMessage);
+        var ret          = il.Create(OpCodes.Ret);
+
+        // Insert in order BEFORE the original first instruction.
+        var sequence = new[] { loadKey, loadCmpKey, callEqOp, brFalseToOrig, loadNewMsg, ret };
+        foreach (var ins in sequence)
+            il.InsertBefore(firstOriginal, ins);
+
+        if (body.MaxStackSize < 2) body.MaxStackSize = 2;
+
+        return new(true, "FontConfigManager::GetText now intercepts $Companion_NoConsoleFoundDesc");
+    }
+}
+
