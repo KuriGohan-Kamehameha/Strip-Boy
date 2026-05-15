@@ -68,6 +68,31 @@
 //        that Bethesda shipped; not relevant on a handheld's flat
 //        bottom screen.
 //
+//  10. HUDColorBridge
+//        PipboyStatusManager.UpdatePipboyEffectColor reads the
+//        EffectColor PipboyArray (3 doubles) from the game's Status
+//        data tree each tick. Bethesda's original guards on
+//        `if (member.IsDirty)` so the colour is only re-applied on
+//        protocol-flagged delta updates — and uses the strict
+//        GetMember overload that throws ExpectedDataMissingException
+//        if F4 isn't sending the node in this build.
+//
+//        The patch rewrites the body to:
+//          - use the tolerant GetMember(string, bool) overload
+//            (harvested from UpdateMinigameFormIds in the same class)
+//          - skip silently if the node is absent
+//          - drop the IsDirty gate so the colour applies even when
+//            the game updates it without re-marking dirty
+//          - Debug.Log once (visible via adb logcat) on first
+//            successful receipt, so we can diagnose whether F4 is
+//            actually transmitting EffectColor in this build.
+//
+//        Downstream chain (game → app HUD) is already wired and
+//        unchanged: setter writes PlayerPrefs + fires
+//        PipboyEffectColorChanged event, CompanionFlashMenu
+//        subscribers call PipboyPostEffect.SetColor which sets the
+//        shader's _Color uniform.
+//
 // Nothing else is touched. UI, audio, in-game protocol, asset loading,
 // localisation, debug menu — all byte-identical to Bethesda's release.
 
@@ -117,6 +142,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickLoopback",          AutoPickLoopback.Apply),
     ("RewriteNoConsoleFoundDesc", RewriteNoConsoleFoundDesc.Apply),
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
+    ("HUDColorBridge",            HUDColorBridge.Apply),
 };
 
 var anyChanged = false;
@@ -812,5 +838,211 @@ static class RewriteNoConsoleFoundDesc
 
         return new(true, "FontConfigManager::GetText now intercepts $Companion_NoConsoleFoundDesc");
     }
+}
+
+static class HUDColorBridge
+{
+    // Rewrite PipboyStatusManager::UpdatePipboyEffectColor to:
+    //   - use the tolerant GetMember<PipboyArray>(string, bool) overload
+    //     so missing nodes return null instead of throwing
+    //   - drop the `IsDirty` gate so colour applies even when the protocol
+    //     doesn't flag delta-dirty
+    //   - log once via UnityEngine.Debug.Log on first delivery from the game
+    //
+    // We never call `.Resolve()` on system types (same reason as in
+    // AutoPickLoopback — Cecil's default resolver would fall through to
+    // the patcher's own .NET 10 corlib and break at runtime). All method
+    // references are harvested from the existing IL of this method, its
+    // sibling UpdateMinigameFormIds, and arbitrary Debug.Log call sites
+    // already in the module.
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyStatusManager")
+            ?? throw new Exception("PipboyStatusManager type not found");
+
+        var method = type.Methods.FirstOrDefault(m => m.Name == "UpdatePipboyEffectColor")
+            ?? throw new Exception("PipboyStatusManager::UpdatePipboyEffectColor not found");
+
+        // Idempotence: the patched body no longer contains a `get_IsDirty`
+        // callvirt. If the original gate is gone, we already patched.
+        var hasIsDirty = method.Body.Instructions.Any(i =>
+            i.Operand is MethodReference mr && mr.Name == "get_IsDirty");
+        if (!hasIsDirty)
+            return new(false, "PipboyStatusManager::UpdatePipboyEffectColor already patched");
+
+        // ---- Harvest method references from existing IL -----------------
+        MethodReference? statusObjectGetter = null;
+        MethodReference? getMember = null;            // GetMember<PipboyArray>(string, bool) — already 2-arg in original IL
+        MethodReference? getElement = null;           // GetElement<PipboyPrimitiveValue<double>>(int)
+        MethodReference? primValueToDouble = null;    // op_Implicit (returns generic T, instantiated to double)
+        MethodReference? appSettingsSetColor = null;  // AppSettings.set_PipboyEffectColor
+        MethodReference? colorCtor = null;            // UnityEngine.Color..ctor(float,float,float)
+
+        foreach (var i in method.Body.Instructions)
+        {
+            if (i.Operand is not MethodReference mr) continue;
+            switch (mr.Name)
+            {
+                case "get_StatusObject":
+                    statusObjectGetter ??= mr; break;
+                case "GetMember":
+                    // Original IL uses the 2-arg GetMember<PipboyArray>(string, bool)
+                    // overload with `false` for the bool. We re-emit the same ref but
+                    // pass `true` for tolerateAbsentValue.
+                    getMember ??= mr; break;
+                case "GetElement":
+                    getElement ??= mr; break;
+                case "op_Implicit":
+                    // Return type is generic T (Var/MVar) — don't filter on metadata
+                    // type. Only one op_Implicit appears in this method, on
+                    // PipboyPrimitiveValue<double>; safe to grab by name alone.
+                    primValueToDouble ??= mr; break;
+                case "set_PipboyEffectColor":
+                    appSettingsSetColor ??= mr; break;
+                case ".ctor"
+                    when mr.DeclaringType.Name == "Color"
+                      && mr.Parameters.Count == 3:
+                    colorCtor ??= mr; break;
+            }
+        }
+
+        if (statusObjectGetter is null) throw new Exception("get_StatusObject ref not harvested");
+        if (getMember is null) throw new Exception("GetMember ref not harvested");
+        if (getElement is null) throw new Exception("GetElement ref not harvested");
+        if (primValueToDouble is null) throw new Exception("op_Implicit ref not harvested");
+        if (appSettingsSetColor is null) throw new Exception("set_PipboyEffectColor ref not harvested");
+        if (colorCtor is null) throw new Exception("Color..ctor(float,float,float) ref not harvested");
+
+        // The 2-arg overload takes (string, bool) — verify before relying on it.
+        var useTolerantOverload =
+            getMember.Parameters.Count == 2 &&
+            getMember.Parameters[1].ParameterType.MetadataType == MetadataType.Boolean;
+
+        // ---- Harvest UnityEngine.Debug.Log(object) from anywhere in module
+        MethodReference? debugLog = null;
+        foreach (var t in module.GetTypes())
+        {
+            foreach (var m in t.Methods)
+            {
+                if (m.Body is null) continue;
+                foreach (var i in m.Body.Instructions)
+                {
+                    if (i.Operand is MethodReference mr3
+                        && mr3.Name == "Log"
+                        && mr3.DeclaringType.FullName == "UnityEngine.Debug"
+                        && mr3.Parameters.Count == 1)
+                    {
+                        debugLog = mr3;
+                        break;
+                    }
+                }
+                if (debugLog != null) break;
+            }
+            if (debugLog != null) break;
+        }
+        if (debugLog is null) throw new Exception("UnityEngine.Debug.Log(object) ref not harvested");
+
+        // ---- Find the PipboyArray local's TypeReference ----------------
+        TypeReference? pipboyArrayType = null;
+        foreach (var v in method.Body.Variables)
+        {
+            if (v.VariableType.Name == "PipboyArray")
+            {
+                pipboyArrayType = v.VariableType;
+                break;
+            }
+        }
+        pipboyArrayType ??= module.GetType("PipboyArray")
+            ?? throw new Exception("PipboyArray type not found");
+
+        // ---- Add (or reuse) a private static bool marker field --------
+        // Doubles as our one-shot "have we logged yet" flag.
+        const string markerFieldName = "_stripboyHudColorLogged";
+        var markerField = type.Fields.FirstOrDefault(f => f.Name == markerFieldName);
+        if (markerField is null)
+        {
+            markerField = new FieldDefinition(markerFieldName,
+                FieldAttributes.Private | FieldAttributes.Static,
+                module.TypeSystem.Boolean);
+            type.Fields.Add(markerField);
+        }
+
+        // ---- Rewrite the body -------------------------------------------
+        var body = method.Body;
+        body.ExceptionHandlers.Clear();
+        body.Variables.Clear();
+        body.Instructions.Clear();
+
+        var memberLocal = new VariableDefinition(pipboyArrayType);
+        body.Variables.Add(memberLocal);
+
+        var il = body.GetILProcessor();
+        var retIns = il.Create(OpCodes.Ret);
+        var skipLogIns = il.Create(OpCodes.Nop);
+
+        //   member = this.StatusObject.GetMember<PipboyArray>("EffectColor", true)
+        il.Append(il.Create(OpCodes.Ldarg_0));
+        il.Append(il.Create(OpCodes.Call, statusObjectGetter));
+        il.Append(il.Create(OpCodes.Ldstr, "EffectColor"));
+        if (useTolerantOverload)
+            il.Append(il.Create(OpCodes.Ldc_I4_1));   // tolerateAbsentValue: true (was: false)
+        il.Append(il.Create(OpCodes.Callvirt, getMember));
+        il.Append(il.Create(OpCodes.Stloc, memberLocal));
+
+        //   if (member == null) return;
+        il.Append(il.Create(OpCodes.Ldloc, memberLocal));
+        il.Append(il.Create(OpCodes.Brfalse, retIns));
+
+        //   if (!_stripboyHudColorLogged) {
+        //       Debug.Log("[strip-boy] EffectColor delivered by F4 protocol");
+        //       _stripboyHudColorLogged = true;
+        //   }
+        il.Append(il.Create(OpCodes.Ldsfld, markerField));
+        il.Append(il.Create(OpCodes.Brtrue, skipLogIns));
+        il.Append(il.Create(OpCodes.Ldstr,
+            "[strip-boy] HUD EffectColor delivered by F4 protocol — bridge active"));
+        il.Append(il.Create(OpCodes.Call, debugLog));
+        il.Append(il.Create(OpCodes.Ldc_I4_1));
+        il.Append(il.Create(OpCodes.Stsfld, markerField));
+        il.Append(skipLogIns);
+
+        //   r = (float)(double)member.GetElement<PipboyPrimitiveValue<double>>(0)
+        //   g = ... (1)
+        //   b = ... (2)
+        // Left on the eval stack as three floats, then consumed by Color..ctor.
+        for (int idx = 0; idx < 3; idx++)
+        {
+            il.Append(il.Create(OpCodes.Ldloc, memberLocal));
+            il.Append(OpCodeForIntConstant(il, idx));
+            il.Append(il.Create(OpCodes.Callvirt, getElement));
+            il.Append(il.Create(OpCodes.Call, primValueToDouble));
+            il.Append(il.Create(OpCodes.Conv_R4));
+        }
+
+        //   AppSettings.PipboyEffectColor = new Color(r, g, b);
+        // The setter persists to PlayerPrefs and fires PipboyEffectColorChanged,
+        // which is what the menu subscribers listen on to update the shader.
+        il.Append(il.Create(OpCodes.Newobj, colorCtor));
+        il.Append(il.Create(OpCodes.Call, appSettingsSetColor));
+
+        il.Append(retIns);
+
+        // Peak stack: 4 (e.g. [r, g, member, idx] just before the 3rd Callvirt).
+        if (body.MaxStackSize < 5) body.MaxStackSize = 5;
+
+        var overloadNote = useTolerantOverload ? "tolerant" : "strict";
+        return new(true,
+            $"PipboyStatusManager::UpdatePipboyEffectColor rewritten "
+          + $"(drop IsDirty gate, {overloadNote} GetMember, one-shot Debug.Log)");
+    }
+
+    static Instruction OpCodeForIntConstant(ILProcessor il, int v) => v switch
+    {
+        0 => il.Create(OpCodes.Ldc_I4_0),
+        1 => il.Create(OpCodes.Ldc_I4_1),
+        2 => il.Create(OpCodes.Ldc_I4_2),
+        3 => il.Create(OpCodes.Ldc_I4_3),
+        _ => il.Create(OpCodes.Ldc_I4, v),
+    };
 }
 

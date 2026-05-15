@@ -16,9 +16,12 @@ After the patch:
   WiFi off
 - it **launches on the secondary display** on dual-screen handhelds
   (the Thor's bottom screen), via a tiny smali launcher activity
+- it **mirrors the in-game HUD colour** from the game's protocol every
+  tick (the existing chain was gated on a delta-dirty flag that some
+  F4 builds don't set when the player changes the colour)
 
 The app's UI, audio, save data, gameplay protocol, and asset loading
-are untouched. Only nine methods in `Assembly-CSharp.dll` change, plus
+are untouched. Only ten methods in `Assembly-CSharp.dll` change, plus
 one new launcher class and a `<intent-filter>` move in the manifest.
 
 This repository contains **the patcher and build scripts**. You supply
@@ -34,9 +37,16 @@ redistributes Bethesda's code or assets.
 | 3 | `HockeyAppSettings.IsValid`                                   | Body → `return false`. `HockeyAppManager.Init` disables the crash-report iOS+Android components, so HockeyApp POSTs to `rink.hockeyapp.net` (Microsoft sunset that service in 2019) never fire. |
 | 4 | `PlatformSelectionMenu.OnFlashReady`                          | Appends `OnItemSelected(0)` — the same call the PC button makes when tapped. The platform-select screen auto-advances; you go straight to the device list. (+3 IL) |
 | 5 | `FlowState.<CheckForConnectivity>OnEntering` (compiler-named) | Body → `FlowTrigger.WIFIEnabled.Fire();`. The original gated on `Application.internetReachability == 2` (LAN reachable), which fails in airplane mode without WiFi. Loopback doesn't need WiFi, so we drop the check. |
+| 6 | `SocketDiscoveryChannel.CoreInitialize` (broadcast Send)      | Wraps the broadcast UDP `Send` in `try { ... } catch (Exception) {}`. In full airplane mode the broadcast throws `SocketException: network unreachable`; without the shield the throw aborts `CoreInitialize` before the loopback send/receive ever run. |
+| 7 | `IPListMenu.SetPossibleConnections`                           | Scans the device list right after it's populated; if any entry has `IP == "127.0.0.1"` it calls `OnListItemSelected(idx)` immediately — same path as a finger-tap. (~25 IL) |
+| 8 | `FontConfigManager.GetText`                                   | Prepends `if (key == "$Companion_NoConsoleFoundDesc") return <GameNative-aware message>;`. All other keys fall through unchanged. |
+| 9 | `DisplayModeSelectionMenu.OnFlashReady`                       | Appends `OnItemSelected(1)` — same shape as patch #4 — which is the "Fullscreen" enum value. Bypasses the one-time "Hardware vs Fullscreen" prompt; Hardware mode is for Bethesda's physical wrist-mount Pip-Boy cradle, not relevant on a handheld's flat bottom screen. |
+| 10 | `PipboyStatusManager.UpdatePipboyEffectColor`                 | Body rewritten: switches the `GetMember<PipboyArray>("EffectColor", false)` call to `tolerateAbsentValue: true` (silent skip if the game's protocol doesn't carry the node), drops the `IsDirty` gate so the colour applies every tick, and emits a one-shot `Debug.Log` to `adb logcat` on first delivery so you can verify the bridge is live. The downstream chain — setter → PlayerPrefs → `PipboyEffectColorChanged` event → `PipboyPostEffect.SetColor` shader uniform — was already wired by Bethesda. |
 
-Total IL delta: ~20 instructions across five methods. The decompiled patched DLL
-is byte-identical to the original except for these five methods. See
+Total IL delta: ~80 instructions across ten methods. The decompiled patched DLL
+is byte-identical to the original except for those ten methods (plus a single
+new private static `bool` field, `_stripboyHudColorLogged`, on
+`PipboyStatusManager` that acts as the once-per-process Debug.Log gate). See
 [`patcher/Program.cs`](patcher/Program.cs) for the exact edits.
 
 ## Build
