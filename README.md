@@ -104,6 +104,14 @@ entry shows up — connect to it.
 Full GameNative path + troubleshooting in
 [`docs/GAMENATIVE.md`](docs/GAMENATIVE.md).
 
+> **Silent NPC dialogue?** If Fallout 4 runs but characters' lips move with no
+> voice (music and cutscenes are fine), that's Wine's FAudio failing to decode
+> the game's xWMA `.fuz` files — separate from the companion. GOG copies don't
+> get GameNative's automatic audio fix; the one-time workaround (install the
+> game's *own* bundled DirectX redist under a non-arm64ec Proton, no downloads)
+> is written up in
+> [`docs/GAMENATIVE.md` §8](docs/GAMENATIVE.md#8-no-npc-dialogue-the-xwma-voice-fix).
+
 ## Airplane-mode safety
 
 After patches 2, 3, and 5, the only sockets the app opens are:
