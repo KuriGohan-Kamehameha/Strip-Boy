@@ -7,7 +7,7 @@ maintenance work has the wire format in one place.
 
 Sources:
 
-- Bethesda's `Fallout 4 Companion` Android APK, v1.2 (`com.bethsoft.pipboy`),
+- Bethesda's `Fallout 4 Companion` Android APK, v1.2 (`com.bethsoft.falloutcompanionapp`),
   decompiled via `ilspycmd` against `Assembly-CSharp.dll`.
 - Community documentation, originally published mid-2015 by `matt0xFF` /
   `rschlaikjer` and refined by the `OpenPipBoy` and `Pip4Mob` projects.
