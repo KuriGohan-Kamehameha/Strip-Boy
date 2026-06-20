@@ -1,9 +1,10 @@
 # Running with Fallout 4 inside GameNative
 
-[GameNative](https://github.com/AshParse/GameNative) is a Box64+Wine wrapper
-for Android, the spiritual sibling of Winlator and Mobox. Fallout 4 has
-been observed running on Snapdragon 8 Gen 3 / 8 Elite class chips at
-720p/30 with DXVK + a sensible texture mod load order.
+[GameNative](https://github.com/utkarshdalal/GameNative) is a Box64+Wine wrapper
+for Android, the spiritual sibling of Winlator and Mobox. Fallout 4 runs under it
+from Snapdragon 8 Gen 2 up — including the AYN Thor (8 Gen 2, "kalama") this repo
+targets — with DXVK and a sensible texture mod load order; 8 Gen 3 / 8 Elite parts
+hold 720p/30 comfortably.
 
 This doc covers the parts that matter for the companion protocol.
 
