@@ -23,7 +23,7 @@ You can find this file from Android via GameNative's "Documents" view or
 by browsing the Wine prefix at:
 
 ```
-/sdcard/Android/data/com.gamenative/files/imagefs/home/<user>/.wine/drive_c/users/<user>/My Documents/My Games/Fallout4/
+/sdcard/Android/data/app.gamenative/files/imagefs/home/<user>/.wine/drive_c/users/<user>/My Documents/My Games/Fallout4/
 ```
 
 (Exact path varies with GameNative version; the imagefs root is the
@@ -89,12 +89,12 @@ adb devices
 adb install -r apk/out/pipboy-loopback.apk
 ```
 
-If `com.bethsoft.pipboy` is already installed (Bethesda's original), `adb`
+If `com.bethsoft.falloutcompanionapp` is already installed (Bethesda's original), `adb`
 will refuse to overlay a debug-signed APK over a production signature.
 Uninstall the original first:
 
 ```bash
-adb uninstall com.bethsoft.pipboy
+adb uninstall com.bethsoft.falloutcompanionapp
 adb install apk/out/pipboy-loopback.apk
 ```
 
@@ -138,7 +138,7 @@ On a stock device, use a packet capture VPN like PCAPdroid instead.)
 
 | Symptom                  | Likely cause                                                    | Fix                                                              |
 |--------------------------|-----------------------------------------------------------------|------------------------------------------------------------------|
-| `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | Original Bethesda APK still installed     | `adb uninstall com.bethsoft.pipboy` then re-install              |
+| `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | Original Bethesda APK still installed     | `adb uninstall com.bethsoft.falloutcompanionapp` then re-install              |
 | Device list empty        | Companion not enabled in-game                                   | Set `bCompanionEnabled=1` in `Fallout4Custom.ini`, reload save   |
 | Device list empty        | Save not loaded                                                 | Load any save first; the server starts with save load            |
 | Loopback shows but Connect refused | GameNative's process is paused                        | Bring GameNative to foreground or run it in split-screen          |
