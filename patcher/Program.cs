@@ -163,6 +163,11 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
+    // B disabled — on-device test 2026-06-21 affected the shader
+    // (gradient banding less severe than the original Update-hook
+    // failure, but still visible). Per-frame AJC.CallStatic has
+    // non-zero renderer impact even without Material.GetColor.
+    // A1 disabled — diagnostic only, no LED behaviour change.
     // A2 disabled — on-device test crashed in libmono.so
     // (mono_class_vtable -> mono_exception_from_name) on first Update tick.
     // Working theory: UnityEngine.AndroidJNI doesn't exist in this Unity
@@ -1353,6 +1358,139 @@ static class FlickerSyncA2
         return new(true,
             $"PipboyPostEffect::Update _Brightness tee'd + JNI-pushed via "
           + $"cached jvalue[] (zero per-frame alloc) "
+          + $"{(needTee ? "[+A1 tee]" : "[reused existing A1 tee]")} "
+          + $"at IL_{brightnessSetFloat.Offset:X4}");
+    }
+}
+
+// Experiment B (post-A2-failure) — like A2 but uses AndroidJavaClass
+// instead of raw AndroidJNI (which doesn't exist in Unity 5.x). One
+// new object[1] + one boxed float per frame; that's the minimum
+// allocation footprint for an AJC.CallStatic call.
+//
+// Strips out Material.GetColor("_Color") (the prior failure's likely
+// culprit), since fB is already on the stack at the SetFloat tee site.
+//
+// Hypothesis after A1 passed on-device 2026-06-21: IL injection in
+// Update itself isn't the trigger; the prior failure was Material.GetColor
+// dirtying material state, or per-frame allocations causing renderer-
+// synchronized GC pauses. B isolates the latter from the former.
+//
+// NOT registered in patches[] by default. To enable, add:
+//   ("FlickerSyncB", FlickerSyncB.Apply),
+// after LEDStickBridge.
+static class FlickerSyncB
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+        var update = type.Methods.FirstOrDefault(m =>
+            m.Name == "Update" && m.Parameters.Count == 0)
+            ?? throw new Exception("PipboyPostEffect::Update() not found");
+
+        // Idempotence keyed off B's dedicated AJC cache field (distinct
+        // from LEDStickBridge's so the two patches don't entangle).
+        const string ajcFieldName = "_stripboyBAjcCls";
+        if (type.Fields.Any(f => f.Name == ajcFieldName))
+            return new(false, "FlickerSyncB already installed");
+
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass",
+            module, unityRef, valueType: false);
+
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        const string fbFieldName = "_stripboyLastFB";
+        bool needTee = !type.Fields.Any(f => f.Name == fbFieldName);
+        var fbField = type.Fields.FirstOrDefault(f => f.Name == fbFieldName);
+        if (fbField is null)
+        {
+            fbField = new FieldDefinition(fbFieldName,
+                FieldAttributes.Private | FieldAttributes.Static,
+                module.TypeSystem.Single);
+            type.Fields.Add(fbField);
+        }
+        var ajcField = new FieldDefinition(ajcFieldName,
+            FieldAttributes.Private | FieldAttributes.Static, ajcType);
+        type.Fields.Add(ajcField);
+
+        Instruction? brightnessSetFloat = null;
+        foreach (var i in update.Body.Instructions)
+        {
+            if (i.OpCode != OpCodes.Ldstr || (i.Operand as string) != "_Brightness") continue;
+            var c = i.Next;
+            while (c != null)
+            {
+                if ((c.OpCode == OpCodes.Callvirt || c.OpCode == OpCodes.Call)
+                    && c.Operand is MethodReference mr
+                    && mr.Name == "SetFloat"
+                    && mr.DeclaringType.Name == "Material")
+                { brightnessSetFloat = c; break; }
+                c = c.Next;
+            }
+            if (brightnessSetFloat != null) break;
+        }
+        if (brightnessSetFloat is null)
+            throw new Exception("Material::SetFloat(\"_Brightness\", ...) call not found in Update");
+
+        var il = update.Body.GetILProcessor();
+        // Anchor where the cache-init branch lands.
+        var afterCacheInit = il.Create(OpCodes.Ldsfld, ajcField);
+
+        var seq = new List<Instruction>();
+        if (needTee)
+        {
+            seq.Add(il.Create(OpCodes.Dup));
+            seq.Add(il.Create(OpCodes.Stsfld, fbField));
+        }
+
+        // if (_stripboyBAjcCls != null) goto afterCacheInit
+        seq.Add(il.Create(OpCodes.Ldsfld, ajcField));
+        seq.Add(il.Create(OpCodes.Brtrue, afterCacheInit));
+
+        // _stripboyBAjcCls = new AndroidJavaClass("io.pipboy.thor.LEDBridge");
+        seq.Add(il.Create(OpCodes.Ldstr, "io.pipboy.thor.LEDBridge"));
+        seq.Add(il.Create(OpCodes.Newobj, ajcCtor));
+        seq.Add(il.Create(OpCodes.Stsfld, ajcField));
+
+        // afterCacheInit: ldsfld _stripboyBAjcCls  (1st arg implicit for callvirt)
+        seq.Add(afterCacheInit);
+
+        // "applyBrightness"
+        seq.Add(il.Create(OpCodes.Ldstr, "applyBrightness"));
+
+        // new object[1] { (object)fbField }
+        seq.Add(il.Create(OpCodes.Ldc_I4_1));
+        seq.Add(il.Create(OpCodes.Newarr, module.TypeSystem.Object));
+        seq.Add(il.Create(OpCodes.Dup));
+        seq.Add(il.Create(OpCodes.Ldc_I4_0));
+        seq.Add(il.Create(OpCodes.Ldsfld, fbField));
+        seq.Add(il.Create(OpCodes.Box, module.TypeSystem.Single));
+        seq.Add(il.Create(OpCodes.Stelem_Ref));
+
+        // _stripboyBAjcCls.CallStatic("applyBrightness", arr)
+        seq.Add(il.Create(OpCodes.Callvirt, callStatic));
+
+        foreach (var ins in seq)
+            il.InsertBefore(brightnessSetFloat, ins);
+
+        // Cache-init path has only ldsfld + ldstr + newobj/stsfld → +2.
+        // Steady state stacks AJC + string + obj[] + (during init: arr,
+        // idx, boxed val) on top of SetFloat's 3 args = up to 9. Bump.
+        if (update.Body.MaxStackSize < 9) update.Body.MaxStackSize = 9;
+
+        return new(true,
+            $"PipboyPostEffect::Update _Brightness tee'd + AJC.CallStatic("
+          + $"\"applyBrightness\", new object[1]{{boxed fB}}) "
           + $"{(needTee ? "[+A1 tee]" : "[reused existing A1 tee]")} "
           + $"at IL_{brightnessSetFloat.Offset:X4}");
     }
