@@ -93,6 +93,30 @@
 //        subscribers call PipboyPostEffect.SetColor which sets the
 //        shader's _Color uniform.
 //
+//  11. LEDStickBridge
+//        Hooks the tail of AppSettings.set_PipboyEffectColor (right
+//        before its final ret, after the PipboyEffectColorChanged
+//        event fires). Reads the just-applied Color, converts to
+//        AYN-formatted ARGB hex, and calls
+//        io.pipboy.thor.LEDBridge.apply(r, g, b) via UnityEngine's
+//        AndroidJavaClass bridge.
+//
+//        The smali helper writes three Settings.System keys that
+//        the AYN HAL reads to drive the analog-stick RGB LEDs:
+//
+//            joystick_led_light_picker_color  = "#FFrrggbb,#FFrrggbb"
+//            joystick_light_enabled           = "1,1"
+//            led_light_brightness_percent     = max(0.05,
+//                                                  dual_screen_brightness_level / 100)
+//
+//        LED brightness tracks the BOTTOM screen brightness (which
+//        is the screen the Pip-Boy companion lives on); the 0.05
+//        floor keeps LEDs perceptible even at minimum.
+//
+//        Requires WRITE_SETTINGS (patch_manifest.py adds it). When
+//        not granted, the smali helper's canWrite gate makes the
+//        whole hook a silent no-op — no exceptions reach C#.
+//
 // Nothing else is touched. UI, audio, in-game protocol, asset loading,
 // localisation, debug menu — all byte-identical to Bethesda's release.
 
@@ -143,6 +167,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("RewriteNoConsoleFoundDesc", RewriteNoConsoleFoundDesc.Apply),
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
+    ("LEDStickBridge",            LEDStickBridge.Apply),
 };
 
 var anyChanged = false;
@@ -1044,5 +1069,156 @@ static class HUDColorBridge
         3 => il.Create(OpCodes.Ldc_I4_3),
         _ => il.Create(OpCodes.Ldc_I4, v),
     };
+}
+
+static class LEDStickBridge
+{
+    const string BridgeClassFqn = "io.pipboy.thor.LEDBridge";
+
+    // Inject a call to io.pipboy.thor.LEDBridge.apply(int r, int g, int b)
+    // at the tail of AppSettings.set_PipboyEffectColor — right before the
+    // method's final ret, after the existing PipboyEffectColorChanged
+    // event has fired.
+    //
+    // The C# equivalent of what we're inserting:
+    //
+    //   using (var cls = new AndroidJavaClass("io.pipboy.thor.LEDBridge"))
+    //       cls.CallStatic("apply",
+    //           (int)(val.r * 255f), (int)(val.g * 255f), (int)(val.b * 255f));
+    //
+    // ...where `val` is local 0 (the post-luma-boost Color). We do NOT
+    // wrap in try/finally — LEDBridge.apply has a canWrite gate and is
+    // expected not to throw — Dispose is just called unconditionally
+    // after CallStatic to free the JNI ref.
+    //
+    // Same .Resolve()-free discipline as AutoPickLoopback: all method
+    // references are constructed manually using module.TypeSystem.* and
+    // the existing UnityEngine assembly reference; the Color.r/g/b
+    // FieldReferences are harvested from the existing IL of this method.
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("AppSettings")
+            ?? throw new Exception("AppSettings type not found");
+        var method = type.Methods.FirstOrDefault(m =>
+            m.Name == "set_PipboyEffectColor" && m.Parameters.Count == 1)
+            ?? throw new Exception("AppSettings::set_PipboyEffectColor(Color) not found");
+
+        var body = method.Body;
+        var ins = body.Instructions;
+
+        // Idempotence: if the body already loads our bridge FQN, we've patched.
+        foreach (var i in ins)
+        {
+            if (i.OpCode == OpCodes.Ldstr && (i.Operand as string) == BridgeClassFqn)
+                return new(false, "AppSettings::set_PipboyEffectColor already hooks LEDBridge");
+        }
+
+        // ---- Harvest existing FieldReferences for Color.r/g/b --------
+        FieldReference? colorR = null, colorG = null, colorB = null;
+        foreach (var i in ins)
+        {
+            if (i.Operand is not FieldReference fr) continue;
+            if (fr.DeclaringType.FullName != "UnityEngine.Color") continue;
+            switch (fr.Name)
+            {
+                case "r": colorR ??= fr; break;
+                case "g": colorG ??= fr; break;
+                case "b": colorB ??= fr; break;
+            }
+        }
+        if (colorR is null || colorG is null || colorB is null)
+            throw new Exception("Color.r/g/b FieldRefs not harvested");
+
+        // ---- Find the UnityEngine assembly reference -----------------
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+
+        // ---- Construct TypeRefs for AndroidJavaClass / AndroidJavaObject
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass",
+            module, unityRef, valueType: false);
+        var ajoType = new TypeReference("UnityEngine", "AndroidJavaObject",
+            module, unityRef, valueType: false);
+
+        // AndroidJavaClass..ctor(string)
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        // AndroidJavaClass.CallStatic(string, object[]) — non-generic, returns void.
+        // CallStatic is declared on AndroidJavaClass (not AndroidJavaObject) for
+        // the static-method dispatch case; the (string, params object[]) overload
+        // is the one with no return value.
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        // AndroidJavaObject.Dispose() — AndroidJavaClass inherits Dispose.
+        // Reference via AndroidJavaObject so we don't need AJC to declare it.
+        var dispose = new MethodReference("Dispose", module.TypeSystem.Void, ajoType)
+            { HasThis = true };
+
+        // ---- Find the final ret to inject before -----------------------
+        var finalRet = ins.LastOrDefault(i => i.OpCode == OpCodes.Ret)
+            ?? throw new Exception("set_PipboyEffectColor has no ret");
+
+        var il = body.GetILProcessor();
+
+        // Helper: push (int)(val.<channel> * 255f), boxed as object.
+        // val is local 0 (the working Color, post-luma-boost).
+        Instruction[] PushBoxedChannel(FieldReference channel) => new[]
+        {
+            il.Create(OpCodes.Ldloca_S, body.Variables[0]),
+            il.Create(OpCodes.Ldfld, channel),
+            il.Create(OpCodes.Ldc_R4, 255f),
+            il.Create(OpCodes.Mul),
+            il.Create(OpCodes.Conv_I4),
+            il.Create(OpCodes.Box, module.TypeSystem.Int32),
+        };
+
+        // Full sequence: build AndroidJavaClass, dup for the later Dispose,
+        // construct the 3-element object[] of boxed ints, dispatch CallStatic,
+        // then Dispose the saved class ref.
+        var seq = new System.Collections.Generic.List<Instruction>
+        {
+            il.Create(OpCodes.Ldstr, BridgeClassFqn),
+            il.Create(OpCodes.Newobj, ajcCtor),
+            il.Create(OpCodes.Dup),                 // [cls, cls]  — top one for Dispose later
+            il.Create(OpCodes.Ldstr, "apply"),
+            il.Create(OpCodes.Ldc_I4_3),
+            il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+        };
+
+        // arr[0] = r
+        seq.Add(il.Create(OpCodes.Dup));
+        seq.Add(il.Create(OpCodes.Ldc_I4_0));
+        seq.AddRange(PushBoxedChannel(colorR));
+        seq.Add(il.Create(OpCodes.Stelem_Ref));
+
+        // arr[1] = g
+        seq.Add(il.Create(OpCodes.Dup));
+        seq.Add(il.Create(OpCodes.Ldc_I4_1));
+        seq.AddRange(PushBoxedChannel(colorG));
+        seq.Add(il.Create(OpCodes.Stelem_Ref));
+
+        // arr[2] = b
+        seq.Add(il.Create(OpCodes.Dup));
+        seq.Add(il.Create(OpCodes.Ldc_I4_2));
+        seq.AddRange(PushBoxedChannel(colorB));
+        seq.Add(il.Create(OpCodes.Stelem_Ref));
+
+        seq.Add(il.Create(OpCodes.Callvirt, callStatic));  // consumes [cls, "apply", arr]
+        seq.Add(il.Create(OpCodes.Callvirt, dispose));     // consumes the duped [cls]
+
+        foreach (var i in seq)
+            il.InsertBefore(finalRet, i);
+
+        // Peak stack we add: [cls, cls, "apply", arr, arr, idx, &val, val.X, 255f]
+        // = 9 deep momentarily (between Ldc_R4 and Mul). Bump if existing is lower.
+        if (body.MaxStackSize < 9) body.MaxStackSize = 9;
+
+        return new(true,
+            $"AppSettings::set_PipboyEffectColor now calls {BridgeClassFqn}.apply(r,g,b)");
+    }
 }
 

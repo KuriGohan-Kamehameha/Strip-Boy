@@ -86,6 +86,7 @@ KEYSTORE="${KEYSTORE:-apk/debug.keystore}"
 PATCHER_PROJ="patcher/Patcher.csproj"
 PATCHER_DLL="patcher/bin/Release/net10.0/pipboy-patcher.dll"
 LAUNCHER_SMALI_SRC="patcher/smali/io/pipboy/thor/LauncherActivity.smali"
+LED_BRIDGE_SMALI_SRC="patcher/smali/io/pipboy/thor/LEDBridge.smali"
 
 ORIGINAL_DLL_PATH="$EXTRACTED_DIR/assets/bin/Data/Managed/Assembly-CSharp.dll"
 DLL_BACKUP="$MANAGED_DIR/Assembly-CSharp.original.dll"
@@ -174,15 +175,20 @@ fi
 log "2/6  manifest + smali"
 python3 scripts/patch_manifest.py "$EXTRACTED_DIR/AndroidManifest.xml" | sed 's/^/     /'
 
-# Drop the LauncherActivity.smali into the smali tree.
+# Drop our smali files into the smali tree. The Pip-Boy APK has multiple
+# smali roots (smali/, smali_classes2/, …); io.pipboy.thor.* is fresh
+# package space we own, so always go into the primary smali/.
 SMALI_DST_DIR="$EXTRACTED_DIR/smali/io/pipboy/thor"
 mkdir -p "$SMALI_DST_DIR"
-if ! cmp -s "$LAUNCHER_SMALI_SRC" "$SMALI_DST_DIR/LauncherActivity.smali"; then
-    cp "$LAUNCHER_SMALI_SRC" "$SMALI_DST_DIR/LauncherActivity.smali"
-    log "     copied LauncherActivity.smali"
-else
-    log "     LauncherActivity.smali already current"
-fi
+for src in "$LAUNCHER_SMALI_SRC" "$LED_BRIDGE_SMALI_SRC"; do
+    dst="$SMALI_DST_DIR/$(basename "$src")"
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
+        cp "$src" "$dst"
+        log "     copied $(basename "$src")"
+    else
+        log "     $(basename "$src") already current"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 3. Build patcher (lazy) + apply Cecil patches to Assembly-CSharp.dll.

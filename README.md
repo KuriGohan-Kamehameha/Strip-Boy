@@ -19,10 +19,14 @@ After the patch:
 - it **mirrors the in-game HUD colour** from the game's protocol every
   tick (the existing chain was gated on a delta-dirty flag that some
   F4 builds don't set when the player changes the colour)
+- it **drives the AYN Thor's analog-stick RGB LEDs** to the same HUD
+  colour, with LED brightness tracking the bottom-screen brightness
+  slider — handheld pulses in sync with the Pip-Boy on the screen
 
 The app's UI, audio, save data, gameplay protocol, and asset loading
-are untouched. Only ten methods in `Assembly-CSharp.dll` change, plus
-one new launcher class and a `<intent-filter>` move in the manifest.
+are untouched. Eleven methods in `Assembly-CSharp.dll` change, plus
+two new helper classes (one launcher activity, one LED bridge), a
+`<intent-filter>` move, and one new `<uses-permission>` in the manifest.
 
 This repository contains **the patcher and build scripts**. You supply
 your own personal copy of the original v1.2 APK; nothing in this repo
@@ -42,8 +46,9 @@ redistributes Bethesda's code or assets.
 | 8 | `FontConfigManager.GetText`                                   | Prepends `if (key == "$Companion_NoConsoleFoundDesc") return <GameNative-aware message>;`. All other keys fall through unchanged. |
 | 9 | `DisplayModeSelectionMenu.OnFlashReady`                       | Appends `OnItemSelected(1)` — same shape as patch #4 — which is the "Fullscreen" enum value. Bypasses the one-time "Hardware vs Fullscreen" prompt; Hardware mode is for Bethesda's physical wrist-mount Pip-Boy cradle, not relevant on a handheld's flat bottom screen. |
 | 10 | `PipboyStatusManager.UpdatePipboyEffectColor`                 | Body rewritten: switches the `GetMember<PipboyArray>("EffectColor", false)` call to `tolerateAbsentValue: true` (silent skip if the game's protocol doesn't carry the node), drops the `IsDirty` gate so the colour applies every tick, and emits a one-shot `Debug.Log` to `adb logcat` on first delivery so you can verify the bridge is live. The downstream chain — setter → PlayerPrefs → `PipboyEffectColorChanged` event → `PipboyPostEffect.SetColor` shader uniform — was already wired by Bethesda. |
+| 11 | `AppSettings.set_PipboyEffectColor` (tail)                    | Right before the final `ret` (after the existing `PipboyEffectColorChanged` event fires), inject `new AndroidJavaClass("io.pipboy.thor.LEDBridge").CallStatic("apply", (int)(r*255), (int)(g*255), (int)(b*255))`. The smali helper writes `joystick_led_light_picker_color`, `joystick_light_enabled`, and `led_light_brightness_percent` (mapped from `dual_screen_brightness_level`) into Settings.System — the AYN HAL reads those directly to drive the analog-stick RGB LEDs. Requires `WRITE_SETTINGS` (added by `patch_manifest.py`); silent no-op via `Settings.System.canWrite` until granted. |
 
-Total IL delta: ~80 instructions across ten methods. The decompiled patched DLL
+Total IL delta: ~80 instructions across eleven methods. The decompiled patched DLL
 is byte-identical to the original except for those ten methods (plus a single
 new private static `bool` field, `_stripboyHudColorLogged`, on
 `PipboyStatusManager` that acts as the once-per-process Debug.Log gate). See
@@ -80,9 +85,21 @@ known-good baseline build.
 adb uninstall com.bethsoft.falloutcompanionapp
 
 adb install -r apk/out/pipboy-loopback.apk
+
+# One-time grant for the analog-stick LED bridge (patch #11). Without
+# this the LED writes silently no-op; the rest of the app is unaffected.
+adb shell appops set com.bethsoft.falloutcompanionapp WRITE_SETTINGS allow
 ```
 
-Or sideload via the Android Files app from the APK file.
+Or sideload via the Android Files app from the APK file. If you can't
+run `appops` (non-developer ADB), grant the same permission via:
+**Settings → Apps → Special access → Modify system settings →
+Fallout 4 Pip-Boy → Allow**.
+
+On AYN Thor specifically: any third-party LED-control app you have
+installed (Bifrost / AYN Magni) will fight the bridge if it's running a
+periodic colour-cycle. If the LEDs only flicker the target colour
+between cycles, force-stop / disable autostart on the LED app.
 
 ## In-game setup
 
