@@ -105,11 +105,17 @@
     invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v5
 
-    # payload = idx + "-" + r + ":" + g + ":" + b + ":" + a + "\n"
+    # payload = "1-" + r + ":" + g + ":" + b + ":" + a + "\n"
+    # Note: the leading "1-" is fixed, NOT the stick index. Each
+    # SN3112 chip exposes a single addressable LED group; writing
+    # prefix 2-/3-/4- is a silent no-op on either chip. Verified
+    # empirically by writing 1-RED, 2-GREEN, 3-BLUE, 4-YELLOW in
+    # sequence to one chip — only the 1- (red) took effect.
+    # PATH (sn3112l vs sn3112r) is what selects left vs right;
+    # the `idx` arg is used only by writeStick's path picker.
     new-instance v0, Ljava/lang/StringBuilder;
     invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
-    invoke-virtual {v0, p0}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
-    const-string v1, "-"
+    const-string v1, "1-"
     invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v0, p1}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
     const-string v1, ":"
