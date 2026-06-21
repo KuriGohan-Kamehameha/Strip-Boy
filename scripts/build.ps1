@@ -73,6 +73,7 @@ $Keystore      = if ($env:KEYSTORE) { $env:KEYSTORE } else { "apk\debug.keystore
 $PatcherProj   = "patcher\Patcher.csproj"
 $PatcherDll    = "patcher\bin\Release\net10.0\pipboy-patcher.dll"
 $LauncherSmali = "patcher\smali\io\pipboy\thor\LauncherActivity.smali"
+$LedBridgeSmali = "patcher\smali\io\pipboy\thor\LEDBridge.smali"
 $ManifestXml   = Join-Path $ExtractedDir "AndroidManifest.xml"
 
 $ApkPath          = "assets/bin/Data/Managed/Assembly-CSharp.dll"
@@ -156,18 +157,21 @@ if ($LASTEXITCODE -ne 0) { Die "patch_manifest.py failed" }
 
 $smaliDst = Join-Path $ExtractedDir "smali\io\pipboy\thor"
 New-Item -ItemType Directory -Force -Path $smaliDst | Out-Null
-$smaliDstFile = Join-Path $smaliDst "LauncherActivity.smali"
-$copy = $true
-if (Test-Path $smaliDstFile) {
-    $a = (Get-FileHash $LauncherSmali -Algorithm SHA256).Hash
-    $b = (Get-FileHash $smaliDstFile -Algorithm SHA256).Hash
-    if ($a -eq $b) { $copy = $false }
-}
-if ($copy) {
-    Copy-Item $LauncherSmali $smaliDstFile -Force
-    Log "     copied LauncherActivity.smali"
-} else {
-    Log "     LauncherActivity.smali already current"
+foreach ($src in @($LauncherSmali, $LedBridgeSmali)) {
+    $name = Split-Path $src -Leaf
+    $dst = Join-Path $smaliDst $name
+    $copy = $true
+    if (Test-Path $dst) {
+        $a = (Get-FileHash $src -Algorithm SHA256).Hash
+        $b = (Get-FileHash $dst -Algorithm SHA256).Hash
+        if ($a -eq $b) { $copy = $false }
+    }
+    if ($copy) {
+        Copy-Item $src $dst -Force
+        Log "     copied $name"
+    } else {
+        Log "     $name already current"
+    }
 }
 
 # ----- 3. Cecil patcher -----------------------------------------------------

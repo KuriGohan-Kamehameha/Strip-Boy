@@ -19,10 +19,14 @@ After the patch:
 - it **mirrors the in-game HUD colour** from the game's protocol every
   tick (the existing chain was gated on a delta-dirty flag that some
   F4 builds don't set when the player changes the colour)
+- it **drives the AYN Thor's analog-stick RGB LEDs** so they change
+  exactly once per screen-colour change, mirroring the bottom-screen
+  brightness slider with a 70 % ceiling
 
 The app's UI, audio, save data, gameplay protocol, and asset loading
-are untouched. Only ten methods in `Assembly-CSharp.dll` change, plus
-one new launcher class and a `<intent-filter>` move in the manifest.
+are untouched. Eleven methods in `Assembly-CSharp.dll` change, plus
+two helper smali classes (the launcher activity and the LED bridge)
+and a `<intent-filter>` move in the manifest. No special permissions.
 
 This repository contains **the patcher and build scripts**. You supply
 your own personal copy of the original v1.2 APK; nothing in this repo
@@ -42,12 +46,14 @@ redistributes Bethesda's code or assets.
 | 8 | `FontConfigManager.GetText`                                   | Prepends `if (key == "$Companion_NoConsoleFoundDesc") return <GameNative-aware message>;`. All other keys fall through unchanged. |
 | 9 | `DisplayModeSelectionMenu.OnFlashReady`                       | Appends `OnItemSelected(1)` — same shape as patch #4 — which is the "Fullscreen" enum value. Bypasses the one-time "Hardware vs Fullscreen" prompt; Hardware mode is for Bethesda's physical wrist-mount Pip-Boy cradle, not relevant on a handheld's flat bottom screen. |
 | 10 | `PipboyStatusManager.UpdatePipboyEffectColor`                 | Body rewritten: switches the `GetMember<PipboyArray>("EffectColor", false)` call to `tolerateAbsentValue: true` (silent skip if the game's protocol doesn't carry the node), drops the `IsDirty` gate so the colour applies every tick, and emits a one-shot `Debug.Log` to `adb logcat` on first delivery so you can verify the bridge is live. The downstream chain — setter → PlayerPrefs → `PipboyEffectColorChanged` event → `PipboyPostEffect.SetColor` shader uniform — was already wired by Bethesda. |
+| 11 | `PipboyPostEffect.SetColor` (tail)                            | After the existing `_materialToModify.SetColor("_Color", color)` (which is the literal moment the screen shader's tint changes), inject `new AndroidJavaClass("io.pipboy.thor.LEDBridge").CallStatic("apply", (int)(r*255), (int)(g*255), (int)(b*255))`. The AndroidJavaClass JNI ref is cached on a new private static field (`_stripboyLedBridgeCls`) so we don't pay ~10 ms of JNI lookups per screen tick. The smali helper drives the AYN Thor's SN3112L/R analog-stick LED controllers **directly** via `/sys/class/sn3112{l,r}/led/brightness` (world-writable on stock firmware — same path Moonbench's Bifrost LED utility uses) in the format `"1-R:G:B:A\n"` / `"2-R:G:B:A\n"`. A is mapped from `dual_screen_brightness_level` (the bottom-screen slider) as `min(bottom, 70) × 255 / 100` — exact match to the screen brightness with a 70 % ceiling. No permissions required. |
 
-Total IL delta: ~80 instructions across ten methods. The decompiled patched DLL
-is byte-identical to the original except for those ten methods (plus a single
-new private static `bool` field, `_stripboyHudColorLogged`, on
-`PipboyStatusManager` that acts as the once-per-process Debug.Log gate). See
-[`patcher/Program.cs`](patcher/Program.cs) for the exact edits.
+Total IL delta: ~85 instructions across eleven methods. The decompiled patched DLL
+is byte-identical to the original except for those eleven methods (plus a private
+static `bool` field `_stripboyHudColorLogged` on `PipboyStatusManager` and a
+private static `AndroidJavaClass` field `_stripboyLedBridgeCls` on
+`PipboyPostEffect`). See [`patcher/Program.cs`](patcher/Program.cs) for the
+exact edits.
 
 ## Build
 

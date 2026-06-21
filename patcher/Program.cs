@@ -93,6 +93,25 @@
 //        subscribers call PipboyPostEffect.SetColor which sets the
 //        shader's _Color uniform.
 //
+//  11. LEDStickBridge
+//        Appends a single call to io.pipboy.thor.LEDBridge.apply
+//        at the tail of PipboyPostEffect.SetColor (right before its
+//        final ret, after the shader's _Color uniform has been set).
+//        The smali helper drives the AYN Thor's SN3112L/R analog-
+//        stick LED controllers directly via
+//        /sys/class/sn3112{l,r}/led/brightness (world-writable on
+//        stock firmware — same path Moonbench's Bifrost utility
+//        uses), with brightness mirroring the bottom-screen
+//        brightness slider, capped at 70 %.
+//
+//        Hook point picked deliberately: PipboyPostEffect.SetColor
+//        is the single leaf method that mutates the visible screen
+//        colour, so the stick colour changes exactly once per
+//        screen colour change — no dedupe, no extra ticks. Sits
+//        outside Unity's menu Init critical path, so even if the
+//        AndroidJavaClass dispatch ever throws, the screen-colour
+//        event chain that drives it has already completed.
+//
 // Nothing else is touched. UI, audio, in-game protocol, asset loading,
 // localisation, debug menu — all byte-identical to Bethesda's release.
 
@@ -143,6 +162,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("RewriteNoConsoleFoundDesc", RewriteNoConsoleFoundDesc.Apply),
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
+    ("LEDStickBridge",            LEDStickBridge.Apply),
 };
 
 var anyChanged = false;
@@ -1044,5 +1064,157 @@ static class HUDColorBridge
         3 => il.Create(OpCodes.Ldc_I4_3),
         _ => il.Create(OpCodes.Ldc_I4, v),
     };
+}
+
+static class LEDStickBridge
+{
+    const string BridgeClassFqn = "io.pipboy.thor.LEDBridge";
+
+    // Append a call to io.pipboy.thor.LEDBridge.apply(int, int, int)
+    // immediately before the final `ret` of PipboyPostEffect.SetColor.
+    // The screen's shader _Color uniform has already been set at this
+    // point — we just relay (r, g, b) as 0..255 ints to the smali
+    // helper, which converts to Bifrost's "<idx>-R:G:B:A\n" wire
+    // format and writes /sys/class/sn3112{l,r}/led/brightness.
+    //
+    // The AndroidJavaClass JNI ref is cached on a new private static
+    // field on PipboyPostEffect so we don't pay ~10 ms of JNI lookups
+    // every screen-tick.
+    //
+    // No try/catch on our IL side — the smali apply() wraps its own
+    // body in try/catch (Throwable) and never throws.
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+
+        var method = type.Methods.FirstOrDefault(m =>
+            m.Name == "SetColor"
+            && m.Parameters.Count == 1
+            && m.Parameters[0].ParameterType.FullName == "UnityEngine.Color")
+            ?? throw new Exception("PipboyPostEffect::SetColor(Color) not found");
+
+        // Idempotence: if the body already loads our bridge FQN, we've patched.
+        foreach (var i in method.Body.Instructions)
+        {
+            if (i.OpCode == OpCodes.Ldstr && (i.Operand as string) == BridgeClassFqn)
+                return new(false, "PipboyPostEffect::SetColor already hooks LEDBridge");
+        }
+
+        // ---- UnityEngine assembly ref + AndroidJavaClass type/method refs
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass",
+            module, unityRef, valueType: false);
+
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        // void AndroidJavaClass.CallStatic(string, object[]) — non-generic.
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType)
+            { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        // ---- Harvest Color.r/g/b FieldReferences from anywhere in the module.
+        // PipboyPostEffect.SetColor itself doesn't read them; scan
+        // AppSettings.set_PipboyEffectColor which does.
+        FieldReference? colorR = null, colorG = null, colorB = null;
+        foreach (var t in module.GetTypes())
+        {
+            foreach (var m in t.Methods)
+            {
+                if (m.Body == null) continue;
+                foreach (var i in m.Body.Instructions)
+                {
+                    if (i.Operand is not FieldReference fr) continue;
+                    if (fr.DeclaringType.FullName != "UnityEngine.Color") continue;
+                    if (fr.Name == "r") colorR ??= fr;
+                    if (fr.Name == "g") colorG ??= fr;
+                    if (fr.Name == "b") colorB ??= fr;
+                }
+                if (colorR != null && colorG != null && colorB != null) break;
+            }
+            if (colorR != null && colorG != null && colorB != null) break;
+        }
+        if (colorR is null || colorG is null || colorB is null)
+            throw new Exception("Color.r/g/b FieldRefs not harvested from module");
+
+        // ---- Cached AndroidJavaClass static field on PipboyPostEffect
+        const string cachedFieldName = "_stripboyLedBridgeCls";
+        var cachedField = type.Fields.FirstOrDefault(f => f.Name == cachedFieldName);
+        if (cachedField is null)
+        {
+            cachedField = new FieldDefinition(cachedFieldName,
+                FieldAttributes.Private | FieldAttributes.Static,
+                ajcType);
+            type.Fields.Add(cachedField);
+        }
+
+        var body = method.Body;
+        var il = body.GetILProcessor();
+        var finalRet = body.Instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
+            ?? throw new Exception("PipboyPostEffect::SetColor has no ret");
+
+        // Helper: push (int)(color.<channel> * 255f) on the stack.
+        // color is arg 1 (instance method, so ldarg.0 = this). Use
+        // ldarga.s to get the struct's address so ldfld can read it.
+        Instruction[] PushChannel(FieldReference channel) => new[]
+        {
+            il.Create(OpCodes.Ldarga_S, method.Parameters[0]),
+            il.Create(OpCodes.Ldfld, channel),
+            il.Create(OpCodes.Ldc_R4, 255f),
+            il.Create(OpCodes.Mul),
+            il.Create(OpCodes.Conv_I4),
+        };
+
+        // Cached-path branch target: this ldsfld is shared between
+        // the "field was already populated" jump and the post-construct
+        // fall-through.
+        var cachedLoad = il.Create(OpCodes.Ldsfld, cachedField);
+
+        var seq = new List<Instruction>
+        {
+            // if (_stripboyLedBridgeCls == null) {
+            il.Create(OpCodes.Ldsfld, cachedField),
+            il.Create(OpCodes.Brtrue, cachedLoad),
+            //     _stripboyLedBridgeCls = new AndroidJavaClass("io.pipboy.thor.LEDBridge");
+            il.Create(OpCodes.Ldstr, BridgeClassFqn),
+            il.Create(OpCodes.Newobj, ajcCtor),
+            il.Create(OpCodes.Stsfld, cachedField),
+            // }
+            // _stripboyLedBridgeCls.CallStatic("apply", new object[]{ r, g, b });
+            cachedLoad,
+            il.Create(OpCodes.Ldstr, "apply"),
+            il.Create(OpCodes.Ldc_I4_3),
+            il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+        };
+
+        var channels = new[] { colorR, colorG, colorB };
+        for (int idx = 0; idx < 3; idx++)
+        {
+            seq.Add(il.Create(OpCodes.Dup));
+            seq.Add(il.Create(OpCodes.Ldc_I4, idx));
+            seq.AddRange(PushChannel(channels[idx]));
+            seq.Add(il.Create(OpCodes.Box, module.TypeSystem.Int32));
+            seq.Add(il.Create(OpCodes.Stelem_Ref));
+        }
+
+        seq.Add(il.Create(OpCodes.Callvirt, callStatic));
+        // No Dispose — keep the JNI ref alive for the process lifetime.
+
+        foreach (var i in seq)
+            il.InsertBefore(finalRet, i);
+
+        // Peak stack we add: [cls, "apply", arr, arr, idx, color.X, 255f]
+        // = 7 deep momentarily (between Ldc_R4 and Mul). The original
+        // SetColor body peaks at 4; bump to 8 to be safe.
+        if (body.MaxStackSize < 8) body.MaxStackSize = 8;
+
+        return new(true,
+            $"PipboyPostEffect::SetColor now relays r,g,b to {BridgeClassFqn}.apply "
+          + $"(cached AJC ref in {cachedFieldName})");
+    }
 }
 
