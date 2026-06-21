@@ -1070,46 +1070,37 @@ static class LEDStickBridge
 {
     const string BridgeClassFqn = "io.pipboy.thor.LEDBridge";
 
-    // Hook PipboyPostEffect.Update (NOT SetColor) so the LEDs follow
-    // the screen at frame rate — colour AND brightness/flicker together.
-    // The shader's `_Brightness` uniform is set every frame from the
-    // instance field `fBrightness`, which is `1 + perlin*pulse + flicker
-    // - 0.1` (range roughly 0.3 .. 1.5). By passing fBrightness as a
-    // multiplier to LEDBridge.apply we get the same scanline / pulse /
-    // flicker dimming on the sticks that the screen shows.
+    // Hook PipboyPostEffect.SetColor (NOT Update). Update is the
+    // per-frame uniform-setting method — adding JNI/sysfs work there
+    // starves the other uniform writes and the shader's _VScanAmount /
+    // _Flicker / _ScanlineFrequency drift visibly (gradient artifact,
+    // missing scanlines). SetColor is event-driven: fires when the
+    // screen tint actually changes, leaving Update's frame budget
+    // intact.  Trade-off: no per-frame flicker sync on the LEDs.
     //
-    // Inject just before Update's final ret. The brfalse at the end
-    // of Update can also jump to that ret (skipping the texel-size
-    // SetVector when _MainTex is null); we insert a Nop anchor before
-    // the ret and retarget that brfalse to it, so both control-flow
-    // paths run our injection.
+    // The smali apply takes a (IIIF) signature — `fBrightness` is the
+    // 4th arg — but from here we always pass 1.0 since SetColor has
+    // no view of the per-frame flicker multiplier.
     //
-    // Each frame:
-    //   apply(
-    //     (int)(material.GetColor("_Color").r * 255),
-    //     (int)(_Color.g * 255),
-    //     (int)(_Color.b * 255),
-    //     fBrightness)
-    //
-    // The AndroidJavaClass JNI ref is cached on a new static field on
-    // PipboyPostEffect so we don't pay JNI lookup cost per frame.
+    // The AndroidJavaClass JNI ref is cached on a new private static
+    // field on PipboyPostEffect so the per-change call doesn't pay
+    // JNI lookup cost.
     public static PatchResult Apply(ModuleDefinition module)
     {
         var type = module.GetType("PipboyPostEffect")
             ?? throw new Exception("PipboyPostEffect type not found");
 
         var method = type.Methods.FirstOrDefault(m =>
-            m.Name == "Update" && m.Parameters.Count == 0)
-            ?? throw new Exception("PipboyPostEffect::Update() not found");
-
-        var body = method.Body;
-        var il = body.GetILProcessor();
+            m.Name == "SetColor"
+            && m.Parameters.Count == 1
+            && m.Parameters[0].ParameterType.FullName == "UnityEngine.Color")
+            ?? throw new Exception("PipboyPostEffect::SetColor(Color) not found");
 
         // Idempotence: if the body already loads our bridge FQN, we've patched.
-        foreach (var i in body.Instructions)
+        foreach (var i in method.Body.Instructions)
         {
             if (i.OpCode == OpCodes.Ldstr && (i.Operand as string) == BridgeClassFqn)
-                return new(false, "PipboyPostEffect::Update already hooks LEDBridge");
+                return new(false, "PipboyPostEffect::SetColor already hooks LEDBridge");
         }
 
         // ---- UnityEngine assembly ref + AndroidJavaClass type/method refs
@@ -1127,31 +1118,7 @@ static class LEDStickBridge
         callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
         callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
 
-        // ---- Harvest _materialToModify (Material) and fBrightness (Single)
-        // instance FieldRefs straight from Update's own IL.
-        FieldReference? materialField = null;
-        FieldReference? fBrightnessField = null;
-        foreach (var i in body.Instructions)
-        {
-            if (i.Operand is not FieldReference fr) continue;
-            if (fr.DeclaringType.FullName != "PipboyPostEffect") continue;
-            if (fr.Name == "_materialToModify") materialField ??= fr;
-            if (fr.Name == "fBrightness") fBrightnessField ??= fr;
-        }
-        if (materialField is null) throw new Exception("_materialToModify FieldRef not harvested");
-        if (fBrightnessField is null) throw new Exception("fBrightness FieldRef not harvested");
-
-        // ---- Material type + GetColor method ref.
-        // Construct GetColor manually using the harvested Material type
-        // (avoids .Resolve() pulling in the wrong corlib).
-        var materialType = materialField.FieldType;
-        var colorType = new TypeReference("UnityEngine", "Color",
-            module, unityRef, valueType: true);
-        var getColor = new MethodReference("GetColor", colorType, materialType)
-            { HasThis = true };
-        getColor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
-
-        // ---- Harvest Color.r/g/b FieldReferences from anywhere in module
+        // ---- Harvest Color.r/g/b FieldReferences from anywhere in the module.
         FieldReference? colorR = null, colorG = null, colorB = null;
         foreach (var t in module.GetTypes())
         {
@@ -1184,41 +1151,17 @@ static class LEDStickBridge
             type.Fields.Add(cachedField);
         }
 
-        // ---- New Color local to stash material.GetColor("_Color") for
-        // r/g/b extraction. Cecil + Mono validate the variable type.
-        var colorLocal = new VariableDefinition(colorType);
-        body.Variables.Add(colorLocal);
-
-        // ---- Find final ret, then insert a Nop anchor just before it
-        // and retarget ANY existing branch that points at the ret to
-        // the new anchor — so even the short-circuit `brfalse →ret`
-        // path still runs our injection.
+        var body = method.Body;
+        var il = body.GetILProcessor();
         var finalRet = body.Instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
-            ?? throw new Exception("PipboyPostEffect::Update has no ret");
+            ?? throw new Exception("PipboyPostEffect::SetColor has no ret");
 
-        var anchor = il.Create(OpCodes.Nop);
-        il.InsertBefore(finalRet, anchor);
-        foreach (var i in body.Instructions)
-        {
-            if (ReferenceEquals(i.Operand, finalRet)) i.Operand = anchor;
-            if (i.Operand is Instruction[] arr)
-            {
-                for (int k = 0; k < arr.Length; k++)
-                    if (ReferenceEquals(arr[k], finalRet)) arr[k] = anchor;
-            }
-        }
-        foreach (var eh in body.ExceptionHandlers)
-        {
-            if (ReferenceEquals(eh.TryStart, finalRet))     eh.TryStart = anchor;
-            if (ReferenceEquals(eh.TryEnd, finalRet))       eh.TryEnd = anchor;
-            if (ReferenceEquals(eh.HandlerStart, finalRet)) eh.HandlerStart = anchor;
-            if (ReferenceEquals(eh.HandlerEnd, finalRet))   eh.HandlerEnd = anchor;
-        }
-
-        // Helper: push (int)(colorLocal.<channel> * 255f).
+        // Helper: push (int)(color.<channel> * 255f).
+        // color is arg 1 (instance method, ldarg.0 = this). ldarga.s
+        // for the struct's address so ldfld can read it.
         Instruction[] PushChannel(FieldReference channel) => new[]
         {
-            il.Create(OpCodes.Ldloca_S, colorLocal),
+            il.Create(OpCodes.Ldarga_S, method.Parameters[0]),
             il.Create(OpCodes.Ldfld, channel),
             il.Create(OpCodes.Ldc_R4, 255f),
             il.Create(OpCodes.Mul),
@@ -1229,13 +1172,6 @@ static class LEDStickBridge
 
         var seq = new List<Instruction>
         {
-            // Color c = this._materialToModify.GetColor("_Color");
-            il.Create(OpCodes.Ldarg_0),
-            il.Create(OpCodes.Ldfld, materialField),
-            il.Create(OpCodes.Ldstr, "_Color"),
-            il.Create(OpCodes.Callvirt, getColor),
-            il.Create(OpCodes.Stloc, colorLocal),
-
             // if (_stripboyLedBridgeCls == null) {
             il.Create(OpCodes.Ldsfld, cachedField),
             il.Create(OpCodes.Brtrue, cachedLoad),
@@ -1244,13 +1180,14 @@ static class LEDStickBridge
             il.Create(OpCodes.Newobj, ajcCtor),
             il.Create(OpCodes.Stsfld, cachedField),
             // }
+            // _stripboyLedBridgeCls.CallStatic("apply",
+            //     new object[]{ r, g, b, 1.0f });
             cachedLoad,
             il.Create(OpCodes.Ldstr, "apply"),
-            il.Create(OpCodes.Ldc_I4_4),                          // object[4]
+            il.Create(OpCodes.Ldc_I4_4),
             il.Create(OpCodes.Newarr, module.TypeSystem.Object),
         };
 
-        // arr[0..2] = (int)(c.r*255), (int)(c.g*255), (int)(c.b*255)
         var channels = new[] { colorR, colorG, colorB };
         for (int idx = 0; idx < 3; idx++)
         {
@@ -1261,26 +1198,24 @@ static class LEDStickBridge
             seq.Add(il.Create(OpCodes.Stelem_Ref));
         }
 
-        // arr[3] = (float) this.fBrightness
+        // arr[3] = 1.0f (no per-frame flicker available here)
         seq.Add(il.Create(OpCodes.Dup));
         seq.Add(il.Create(OpCodes.Ldc_I4_3));
-        seq.Add(il.Create(OpCodes.Ldarg_0));
-        seq.Add(il.Create(OpCodes.Ldfld, fBrightnessField));
+        seq.Add(il.Create(OpCodes.Ldc_R4, 1f));
         seq.Add(il.Create(OpCodes.Box, module.TypeSystem.Single));
         seq.Add(il.Create(OpCodes.Stelem_Ref));
 
         seq.Add(il.Create(OpCodes.Callvirt, callStatic));
-        // No Dispose — JNI ref kept for process lifetime.
 
         foreach (var i in seq)
             il.InsertBefore(finalRet, i);
 
         // Peak stack we add: [cls, "apply", arr, arr, idx, &color, color.X, 255f]
-        // = 8 deep momentarily. Update's existing max is ~5; bump to 9.
-        if (body.MaxStackSize < 9) body.MaxStackSize = 9;
+        // = 8 deep momentarily.
+        if (body.MaxStackSize < 8) body.MaxStackSize = 8;
 
         return new(true,
-            $"PipboyPostEffect::Update now relays (r,g,b,fBrightness) to "
+            $"PipboyPostEffect::SetColor now relays (r,g,b,1.0f) to "
           + $"{BridgeClassFqn}.apply (cached AJC ref in {cachedFieldName})");
     }
 }
