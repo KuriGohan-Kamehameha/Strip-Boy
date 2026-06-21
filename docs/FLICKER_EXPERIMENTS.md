@@ -569,6 +569,162 @@ to the direct-sysfs path it already has.
 
 ---
 
+## Wiring Strip-Boy to flickerd (auto-detect dispatch)
+
+The flickerd APK at `flickerd/` is buildable, but Strip-Boy's current
+`LEDBridge.smali` still writes sysfs directly. To make the in-Pip-Boy
+side seamless, modify `LEDBridge.apply` to:
+
+1. On first call, check via `PackageManager.getPackageInfo` whether
+   `io.pipboy.thor.flickerd` is installed.
+2. If yes → fire-and-forget broadcast Intent (`io.pipboy.thor.SET_COLOR`).
+3. If no → fall through to the existing async sysfs path.
+
+No Cecil change needed — `LEDStickBridge` keeps calling
+`LEDBridge.apply` exactly as before. The dispatch lives entirely in
+smali.
+
+**Drop-in additions to `patcher/smali/io/pipboy/thor/LEDBridge.smali`**:
+
+Add two static fields:
+
+```smali
+# 0 = not yet detected, 1 = sysfs path, 2 = broadcast path
+.field private static dispatchMode:I
+```
+
+Replace `apply(IIIF)V`'s body with the dispatcher:
+
+```smali
+.method public static apply(IIIF)V
+    .registers 7
+    .param p0, "r"
+    .param p1, "g"
+    .param p2, "b"
+    .param p3, "fBrightness"
+
+    sput p0, Lio/pipboy/thor/LEDBridge;->pendingR:I
+    sput p1, Lio/pipboy/thor/LEDBridge;->pendingG:I
+    sput p2, Lio/pipboy/thor/LEDBridge;->pendingB:I
+    sput p3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+
+    sget v0, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    if-nez v0, :have_mode
+    invoke-static {}, Lio/pipboy/thor/LEDBridge;->detectDispatchMode()I
+    move-result v0
+    sput v0, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+
+    :have_mode
+    const/4 v1, 0x2
+    if-ne v0, v1, :sysfs_path
+
+    invoke-static {p0, p1, p2}, Lio/pipboy/thor/LEDBridge;->sendColorBroadcast(III)V
+    return-void
+
+    :sysfs_path
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+    return-void
+.end method
+```
+
+Add two helper methods:
+
+```smali
+.method private static detectDispatchMode()I
+    .registers 5
+
+    :try_start
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v0, :default_sysfs
+    invoke-virtual {v0}, Landroid/content/Context;->getPackageManager()Landroid/content/pm/PackageManager;
+    move-result-object v1
+    const-string v2, "io.pipboy.thor.flickerd"
+    const/4 v3, 0x0
+    invoke-virtual {v1, v2, v3}, Landroid/content/pm/PackageManager;->getPackageInfo(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;
+    # No exception → installed
+    const-string v0, "strip-boy"
+    const-string v1, "dispatch = broadcast (flickerd detected)"
+    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    const/4 v0, 0x2
+    return v0
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch_default
+
+    :catch_default
+    move-exception v0
+    :default_sysfs
+    const-string v0, "strip-boy"
+    const-string v1, "dispatch = sysfs (flickerd not installed)"
+    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    const/4 v0, 0x1
+    return v0
+.end method
+
+
+.method private static sendColorBroadcast(III)V
+    .registers 8
+    .param p0, "r"
+    .param p1, "g"
+    .param p2, "b"
+
+    :try_start
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v0, :done
+
+    # intent = new Intent("io.pipboy.thor.SET_COLOR")
+    new-instance v1, Landroid/content/Intent;
+    const-string v2, "io.pipboy.thor.SET_COLOR"
+    invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
+
+    # intent.setPackage("io.pipboy.thor.flickerd")
+    const-string v2, "io.pipboy.thor.flickerd"
+    invoke-virtual {v1, v2}, Landroid/content/Intent;->setPackage(Ljava/lang/String;)Landroid/content/Intent;
+
+    # intent.putExtra("r", r) / "g", g / "b", b
+    const-string v2, "r"
+    invoke-virtual {v1, v2, p0}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "g"
+    invoke-virtual {v1, v2, p1}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "b"
+    invoke-virtual {v1, v2, p2}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    # activity.sendBroadcast(intent)
+    invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
+
+    :done
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch
+    return-void
+
+    :catch
+    move-exception v0
+    const-string v1, "strip-boy"
+    const-string v2, "sendColorBroadcast threw"
+    invoke-static {v1, v2, v0}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
+    return-void
+.end method
+```
+
+That's it. The Cecil patch (`LEDStickBridge` in `patcher/Program.cs`)
+needs no change — it still emits the same
+`AndroidJavaClass("io.pipboy.thor.LEDBridge").CallStatic("apply", ...)`
+sequence.
+
+**Behaviour matrix** after this change:
+
+| flickerd installed? | LED writer | Flicker visible? |
+|---|---|---|
+| No  | Strip-Boy's existing async-sysfs HandlerThread | No (event-driven only) |
+| Yes | Broadcast to flickerd; flickerd ticks at 30 Hz | Yes (Perlin-ish fake flicker, see flickerd/README.md) |
+
+**Note**: the broadcast path is fire-and-forget on the main thread —
+`Activity.sendBroadcast` is non-blocking, returns immediately, no GC
+pressure beyond the one `Intent` allocation per colour change. Safe to
+do in `SetColor`'s tail. Doesn't risk the shader.
+
 ## Investigation status
 
 | Tick | Output |
@@ -576,9 +732,18 @@ to the direct-sysfs path it already has.
 | 1 | Identified three experiments (A, B, C). Picked SetFloat tee as smallest test. |
 | 2 | Sketched A1 Cecil patch (minimal IL, no JNI). Doc committed. |
 | 3 | Sketched A2 Cecil (zero-alloc JNI via jvalue[]) and C (sidekick APK skeleton). Doc committed. |
+| 4 | Materialized `flickerd/` as buildable directory (~520 LOC, ~10 KB APK). |
+| 5 | Wrote Strip-Boy-side smali dispatcher: auto-detects flickerd via PackageManager, chooses broadcast vs sysfs. End-to-end C path is now fully spec'd. |
 
 Pick-order when at the keyboard: **A1 → A2 → C**. A1 takes 5 min and
 disambiguates the entire investigation.
+
+If you skip straight to C without testing A1/A2: build flickerd
+(`flickerd/scripts/build.sh`), install it (`adb install -r out/flickerd.apk`),
+paste the smali dispatcher above into
+`patcher/smali/io/pipboy/thor/LEDBridge.smali`, rebuild Strip-Boy
+(`FORCE_RESTART=1 scripts/build.sh`), install. First launch will
+`adb logcat -s strip-boy` confirm with `dispatch = broadcast`.
 
 ---
 
