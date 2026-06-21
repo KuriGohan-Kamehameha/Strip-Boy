@@ -24,6 +24,42 @@
     # super.onCreate(savedInstanceState)
     invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
 
+    # --- default green LED state ---------------------------------------
+    # Write a dim default-green payload to BOTH stick controllers
+    # before Unity loads, so the sticks come on in a known state
+    # instead of whatever leftover colour the kernel was holding (e.g.
+    # bright white from a stale Bifrost session). Once Unity boots and
+    # PipboyPostEffect.SetColor fires, LEDBridge.apply overwrites with
+    # the actual saved/F4-delivered colour. /sys/class/sn3112{l,r}/led/
+    # brightness is world-writable on stock AYN Thor firmware, so the
+    # write succeeds from this activity's own UID — no UnityPlayer
+    # required (it's not set yet at this point in the launch flow).
+    :default_led_try
+    new-instance v0, Ljava/io/FileOutputStream;
+    const-string v1, "/sys/class/sn3112l/led/brightness"
+    invoke-direct {v0, v1}, Ljava/io/FileOutputStream;-><init>(Ljava/lang/String;)V
+    const-string v1, "1-0:5:0:255\n"
+    invoke-virtual {v1}, Ljava/lang/String;->getBytes()[B
+    move-result-object v1
+    invoke-virtual {v0, v1}, Ljava/io/FileOutputStream;->write([B)V
+    invoke-virtual {v0}, Ljava/io/FileOutputStream;->close()V
+
+    new-instance v0, Ljava/io/FileOutputStream;
+    const-string v1, "/sys/class/sn3112r/led/brightness"
+    invoke-direct {v0, v1}, Ljava/io/FileOutputStream;-><init>(Ljava/lang/String;)V
+    const-string v1, "1-0:5:0:255\n"
+    invoke-virtual {v1}, Ljava/lang/String;->getBytes()[B
+    move-result-object v1
+    invoke-virtual {v0, v1}, Ljava/io/FileOutputStream;->write([B)V
+    invoke-virtual {v0}, Ljava/io/FileOutputStream;->close()V
+    :default_led_end
+    .catch Ljava/lang/Throwable; {:default_led_try .. :default_led_end} :default_led_catch
+    goto :default_led_done
+    :default_led_catch
+    move-exception v0
+    :default_led_done
+    # --- end default green LED state ----------------------------------
+
     # v0 = new Intent()
     new-instance v0, Landroid/content/Intent;
 
