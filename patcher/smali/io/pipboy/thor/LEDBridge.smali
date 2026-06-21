@@ -177,10 +177,13 @@
     invoke-static {v3, v9}, Ljava/lang/Math;->min(FF)F
     move-result v3
 
-    # alpha_f = (float)bottom * fB_clamped * 0.8925
+    # alpha_f = (float)bottom * fB_clamped * 0.1275
+    # 0.1275 = 0.05 × 2.55 (5% LED-PWM ceiling × 255/100).
+    # At bottom=100, fB=1.0 → alpha = 12.75 ≈ 12 (5% PWM).
+    # At bottom=44,  fB=1.0 → alpha = 5.6  ≈ 5  (2% PWM).
     int-to-float v9, v8
     mul-float v9, v9, v3
-    const v10, 0x3f644bc7              # 0.8925f = 0.35 × 2.55
+    const v10, 0x3e028f5c              # 0.1275f
     mul-float v9, v9, v10
 
     # clamp upper at 255.0
