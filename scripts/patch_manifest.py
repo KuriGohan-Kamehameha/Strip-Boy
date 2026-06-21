@@ -2,20 +2,10 @@
 """
 patch_manifest.py — apply manifest changes for Strip-Boy.
 
-Idempotent. Single manifest change:
-
-  Add io.pipboy.thor.LauncherActivity as the MAIN/LAUNCHER activity,
-  strip the launcher intent-filter from UnityPlayerNativeActivity, so
-  taps on the launcher icon route through our display-redirecting
-  LauncherActivity first.
-
-(Earlier revisions also injected WRITE_SETTINGS / WRITE_SECURE_SETTINGS
-to let LEDBridge write Settings.System.joystick_led_light_picker_color.
-That approach was abandoned: AYN's vendor SettingsProvider rejects
-those writes from non-privileged UIDs even with both perms granted.
-LEDBridge now writes directly to /sys/class/sn3112{l,r}/led/brightness
-— world-writable on stock AYN Thor firmware, the same path Moonbench
-Bifrost uses — so no permissions are needed.)
+Idempotent. Adds io.pipboy.thor.LauncherActivity as the MAIN/LAUNCHER
+activity, strips the launcher intent-filter from UnityPlayerNativeActivity,
+so taps on the launcher icon route through our display-redirecting
+LauncherActivity first.
 
 Run with the path to the decoded AndroidManifest.xml as the argument:
 
@@ -31,7 +21,6 @@ ET.register_namespace("android", ANDROID_NS)
 NAME_ATTR = f"{{{ANDROID_NS}}}name"
 LAUNCHER_FQN = "io.pipboy.thor.LauncherActivity"
 UNITY_FQN = "com.unity3d.player.UnityPlayerNativeActivity"
-
 
 def main(path: str) -> int:
     tree = ET.parse(path)
@@ -91,8 +80,7 @@ def main(path: str) -> int:
     cat2.set(NAME_ATTR, "android.intent.category.LEANBACK_LAUNCHER")
 
     tree.write(path, xml_declaration=True, encoding="utf-8")
-    print(f"patched: stripped {removed} launcher intent-filter(s) from {UNITY_FQN}, "
-          f"added {LAUNCHER_FQN}")
+    print(f"patched: stripped {removed} launcher intent-filter(s) from {UNITY_FQN}, added {LAUNCHER_FQN}")
     return 0
 
 

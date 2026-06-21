@@ -19,14 +19,10 @@ After the patch:
 - it **mirrors the in-game HUD colour** from the game's protocol every
   tick (the existing chain was gated on a delta-dirty flag that some
   F4 builds don't set when the player changes the colour)
-- it **drives the AYN Thor's analog-stick RGB LEDs** to the same HUD
-  colour, with LED brightness tracking the bottom-screen brightness
-  slider — handheld pulses in sync with the Pip-Boy on the screen
 
 The app's UI, audio, save data, gameplay protocol, and asset loading
-are untouched. Eleven methods in `Assembly-CSharp.dll` change, plus
-two new helper classes (one launcher activity, one LED bridge), a
-`<intent-filter>` move, and one new `<uses-permission>` in the manifest.
+are untouched. Only ten methods in `Assembly-CSharp.dll` change, plus
+one new launcher class and a `<intent-filter>` move in the manifest.
 
 This repository contains **the patcher and build scripts**. You supply
 your own personal copy of the original v1.2 APK; nothing in this repo
@@ -46,9 +42,8 @@ redistributes Bethesda's code or assets.
 | 8 | `FontConfigManager.GetText`                                   | Prepends `if (key == "$Companion_NoConsoleFoundDesc") return <GameNative-aware message>;`. All other keys fall through unchanged. |
 | 9 | `DisplayModeSelectionMenu.OnFlashReady`                       | Appends `OnItemSelected(1)` — same shape as patch #4 — which is the "Fullscreen" enum value. Bypasses the one-time "Hardware vs Fullscreen" prompt; Hardware mode is for Bethesda's physical wrist-mount Pip-Boy cradle, not relevant on a handheld's flat bottom screen. |
 | 10 | `PipboyStatusManager.UpdatePipboyEffectColor`                 | Body rewritten: switches the `GetMember<PipboyArray>("EffectColor", false)` call to `tolerateAbsentValue: true` (silent skip if the game's protocol doesn't carry the node), drops the `IsDirty` gate so the colour applies every tick, and emits a one-shot `Debug.Log` to `adb logcat` on first delivery so you can verify the bridge is live. The downstream chain — setter → PlayerPrefs → `PipboyEffectColorChanged` event → `PipboyPostEffect.SetColor` shader uniform — was already wired by Bethesda. |
-| 11 | `AppSettings.get_PipboyEffectColor` (tail) **+** `AppSettings.set_PipboyEffectColor` (tail) | Both property accessors get an `AndroidJavaClass("io.pipboy.thor.LEDBridge").CallStatic("apply", r, g, b)` call appended right before their final `ret`. The setter hook covers F4-protocol-driven colour changes (via patch #10) and the in-app HUD-colour picker; the getter hook covers the startup case where the first `CompanionFlashMenu.Init` reads the saved PlayerPrefs colour. The AndroidJavaClass JNI ref is cached on a new private static field (`_stripboyLedBridgeCls`) so we don't pay ~10 ms of JNI lookups per 30 Hz protocol tick. The smali helper drives the SN3112L/R analog-stick LED controllers **directly** via `/sys/class/sn3112{l,r}/led/brightness` (world-writable on stock AYN Thor firmware — same path Moonbench's Bifrost uses) in the format `"1-R:G:B:A"` / `"2-R:G:B:A"`. A is mapped from `dual_screen_brightness_level` with a 70 % cap and 5 % floor, so the LEDs track the bottom-screen slider. Dedupe on `(r, g, b, A)` collapses idle ticks to no-ops. No special permissions required. |
 
-Total IL delta: ~80 instructions across eleven methods. The decompiled patched DLL
+Total IL delta: ~80 instructions across ten methods. The decompiled patched DLL
 is byte-identical to the original except for those ten methods (plus a single
 new private static `bool` field, `_stripboyHudColorLogged`, on
 `PipboyStatusManager` that acts as the once-per-process Debug.Log gate). See
@@ -87,16 +82,7 @@ adb uninstall com.bethsoft.falloutcompanionapp
 adb install -r apk/out/pipboy-loopback.apk
 ```
 
-Or sideload via the Android Files app from the APK file. **No special
-permissions need to be granted** — the LED bridge (patch #11) writes
-directly to `/sys/class/sn3112{l,r}/led/brightness`, which AYN ships
-world-writable, so the app works as soon as it's installed.
-
-On AYN Thor specifically: any third-party LED-control app you have
-installed (Bifrost / AYN Magni) will fight the bridge if it's running
-a periodic colour-cycle, since they write the same sysfs nodes. If the
-LEDs only flicker the target colour between cycles, force-stop or
-disable autostart on the LED app.
+Or sideload via the Android Files app from the APK file.
 
 ## In-game setup
 

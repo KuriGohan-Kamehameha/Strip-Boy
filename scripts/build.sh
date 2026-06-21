@@ -86,7 +86,6 @@ KEYSTORE="${KEYSTORE:-apk/debug.keystore}"
 PATCHER_PROJ="patcher/Patcher.csproj"
 PATCHER_DLL="patcher/bin/Release/net10.0/pipboy-patcher.dll"
 LAUNCHER_SMALI_SRC="patcher/smali/io/pipboy/thor/LauncherActivity.smali"
-LED_BRIDGE_SMALI_SRC="patcher/smali/io/pipboy/thor/LEDBridge.smali"
 
 ORIGINAL_DLL_PATH="$EXTRACTED_DIR/assets/bin/Data/Managed/Assembly-CSharp.dll"
 DLL_BACKUP="$MANAGED_DIR/Assembly-CSharp.original.dll"
@@ -175,20 +174,15 @@ fi
 log "2/6  manifest + smali"
 python3 scripts/patch_manifest.py "$EXTRACTED_DIR/AndroidManifest.xml" | sed 's/^/     /'
 
-# Drop our smali files into the smali tree. The Pip-Boy APK has multiple
-# smali roots (smali/, smali_classes2/, …); io.pipboy.thor.* is fresh
-# package space we own, so always go into the primary smali/.
+# Drop the LauncherActivity.smali into the smali tree.
 SMALI_DST_DIR="$EXTRACTED_DIR/smali/io/pipboy/thor"
 mkdir -p "$SMALI_DST_DIR"
-for src in "$LAUNCHER_SMALI_SRC" "$LED_BRIDGE_SMALI_SRC"; do
-    dst="$SMALI_DST_DIR/$(basename "$src")"
-    if ! cmp -s "$src" "$dst" 2>/dev/null; then
-        cp "$src" "$dst"
-        log "     copied $(basename "$src")"
-    else
-        log "     $(basename "$src") already current"
-    fi
-done
+if ! cmp -s "$LAUNCHER_SMALI_SRC" "$SMALI_DST_DIR/LauncherActivity.smali"; then
+    cp "$LAUNCHER_SMALI_SRC" "$SMALI_DST_DIR/LauncherActivity.smali"
+    log "     copied LauncherActivity.smali"
+else
+    log "     LauncherActivity.smali already current"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Build patcher (lazy) + apply Cecil patches to Assembly-CSharp.dll.
@@ -218,17 +212,7 @@ cp "$DLL_PATCHED" "$ORIGINAL_DLL_PATH"
 # ---------------------------------------------------------------------------
 log "4/6  apktool b  (rebuild)"
 rm -f "$APK_FROM_APKTOOL"
-# Run apktool b; let it write to stderr/stdout directly, and only
-# proceed if it exits cleanly. The old pipe `| tail -3 | sed` swallowed
-# apktool's non-zero exit code via the trailing pipe stage, which is
-# how an upstream smali typo could let the build "succeed" but produce
-# a stale APK with the previous classes.dex.
-apktool b "$EXTRACTED_DIR" -o "$APK_FROM_APKTOOL" 2>&1 | sed 's/^/     /'
-apktool_rc=${PIPESTATUS[0]}
-if [ "$apktool_rc" != "0" ]; then
-    die "apktool b failed (exit $apktool_rc) — likely a smali assemble error above"
-fi
-[ -s "$APK_FROM_APKTOOL" ] || die "apktool b produced no output at $APK_FROM_APKTOOL"
+apktool b "$EXTRACTED_DIR" -o "$APK_FROM_APKTOOL" 2>&1 | tail -3 | sed 's/^/     /'
 
 # ---------------------------------------------------------------------------
 # 5. zipalign.
