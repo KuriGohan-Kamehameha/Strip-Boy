@@ -87,7 +87,6 @@ PATCHER_PROJ="patcher/Patcher.csproj"
 PATCHER_DLL="patcher/bin/Release/net10.0/pipboy-patcher.dll"
 LAUNCHER_SMALI_SRC="patcher/smali/io/pipboy/thor/LauncherActivity.smali"
 LED_BRIDGE_SMALI_SRC="patcher/smali/io/pipboy/thor/LEDBridge.smali"
-PULSE_RESET_SMALI_SRC="patcher/smali/io/pipboy/thor/PulseReset.smali"
 
 ORIGINAL_DLL_PATH="$EXTRACTED_DIR/assets/bin/Data/Managed/Assembly-CSharp.dll"
 DLL_BACKUP="$MANAGED_DIR/Assembly-CSharp.original.dll"
@@ -180,7 +179,7 @@ python3 scripts/patch_manifest.py "$EXTRACTED_DIR/AndroidManifest.xml" | sed 's/
 # own package space — drop alongside LauncherActivity.smali).
 SMALI_DST_DIR="$EXTRACTED_DIR/smali/io/pipboy/thor"
 mkdir -p "$SMALI_DST_DIR"
-for src in "$LAUNCHER_SMALI_SRC" "$LED_BRIDGE_SMALI_SRC" "$PULSE_RESET_SMALI_SRC"; do
+for src in "$LAUNCHER_SMALI_SRC" "$LED_BRIDGE_SMALI_SRC"; do
     dst="$SMALI_DST_DIR/$(basename "$src")"
     if ! cmp -s "$src" "$dst" 2>/dev/null; then
         cp "$src" "$dst"

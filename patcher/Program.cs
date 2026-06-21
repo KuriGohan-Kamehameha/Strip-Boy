@@ -464,14 +464,35 @@ static class FlickerSeed
         // Random.Range(min,max)) → seeded vscan RNG. Independent sequence so it
         // never perturbs the flicker draws.
         int vredirected = 0;
+        Instruction? vscanCall = null;
         for (int i = 0; i < toggleIdx; i++)
         {
             if (IsRandomRangeFF(instrs[i]))
             {
                 instrs[i].OpCode = OpCodes.Call;
                 instrs[i].Operand = vrange;
+                vscanCall = instrs[i];
                 vredirected++;
             }
+        }
+
+        // DIAGNOSTIC (measure-only, remove after): log each screen vscan roll
+        // start so screen-vs-stick roll timing can be compared in logcat. The
+        // redirected vscan call fires exactly on a roll start; its float return
+        // stays on the stack across the Debug.Log(object) call, then the
+        // original stfld consumes it. Unity logcat tag = "Unity".
+        if (vscanCall != null)
+        {
+            var unityRef2 = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+            var debugType = new TypeReference("UnityEngine", "Debug", module, unityRef2, valueType: false);
+            var debugLog = new MethodReference("Log", module.TypeSystem.Void, debugType);
+            debugLog.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+            var dil = update.Body.GetILProcessor();
+            var logStr = dil.Create(OpCodes.Ldstr, "STRIPBOY_VSCAN_ROLL");
+            var logCall = dil.Create(OpCodes.Call, debugLog);
+            dil.InsertAfter(vscanCall, logStr);
+            dil.InsertAfter(logStr, logCall);
+            if (update.Body.MaxStackSize < 8) update.Body.MaxStackSize = 8;
         }
 
         return new(true,

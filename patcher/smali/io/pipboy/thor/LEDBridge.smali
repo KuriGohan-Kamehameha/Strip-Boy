@@ -82,13 +82,6 @@
 # Bifrost cleanly reverts.
 .field private static heartbeatStarted:Z
 
-# Shared single-shot "return to resting brightness" Runnable. menuPulse()
-# and staticBurst() both removeCallbacks()+postDelayed() this one instance,
-# so the latest reaction's return time wins (a static burst overlapping a
-# nav pulse plays full-length instead of being cut short).
-.field private static pulseReset:Lio/pipboy/thor/PulseReset;
-
-
 .method static constructor <clinit>()V
     .registers 5
     const/4 v0, -0x1
@@ -113,11 +106,6 @@
     new-instance v2, Lio/pipboy/thor/LEDBridge;
     invoke-direct {v2}, Lio/pipboy/thor/LEDBridge;-><init>()V
     sput-object v2, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
-
-    # Shared brightness-return Runnable (see field doc).
-    new-instance v0, Lio/pipboy/thor/PulseReset;
-    invoke-direct {v0}, Lio/pipboy/thor/PulseReset;-><init>()V
-    sput-object v0, Lio/pipboy/thor/LEDBridge;->pulseReset:Lio/pipboy/thor/PulseReset;
 
     return-void
 .end method
@@ -588,19 +576,20 @@
 # onNewPage/onNewTab → this). Brief brightness pop on each page/tab switch.
 # ---------------------------------------------------------------------------
 
-# Send a PIPBOY ACTION_DISPLAY at a given intensity (green, phaseSeconds
-# carried from pendingFB so the brightness change doesn't desync the
-# screen-matched flicker). Package-private so PulseReset can call it.
-.method static pipboyAt(I)V
-    .registers 8
-    .param p0, "intensity"
+# Send a lightweight ACTION_PULSE to Bifrost — an in-place transient trigger
+# on the running PIPBOY effect (a brief brightness pop, or a TV-static
+# scramble). No override replacement, no animation restart, NOT rate-limited,
+# so it can't be clobbered by the heartbeat and lands on every rapid switch.
+.method static sendPulse(Ljava/lang/String;)V
+    .registers 6
+    .param p0, "kind"
 
     :try_start
     sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
     if-eqz v0, :done
 
     new-instance v1, Landroid/content/Intent;
-    const-string v2, "com.moonbench.bifrost.api.ACTION_DISPLAY"
+    const-string v2, "com.moonbench.bifrost.api.ACTION_PULSE"
     invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
 
     new-instance v2, Landroid/content/ComponentName;
@@ -609,37 +598,8 @@
     invoke-direct {v2, v3, v4}, Landroid/content/ComponentName;-><init>(Ljava/lang/String;Ljava/lang/String;)V
     invoke-virtual {v1, v2}, Landroid/content/Intent;->setComponent(Landroid/content/ComponentName;)Landroid/content/Intent;
 
-    const-string v2, "apiVersion"
-    const/4 v3, 0x1
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    const-string v2, "effect"
-    const-string v3, "PIPBOY"
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
-
-    # color = 0xFF00FF00 (Pip-Boy green)
-    const/high16 v5, -0x1000000
-    const/16 v6, 0xff
-    shl-int/lit8 v6, v6, 0x8
-    or-int v5, v5, v6
-    const-string v2, "color"
-    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-    const-string v2, "colorRight"
-    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    const-string v2, "intensity"
-    invoke-virtual {v1, v2, p0}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-    const-string v2, "intensityScale"
-    const/16 v3, 0xff
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    const-string v2, "until"
-    const-string v3, "EXPLICIT_CLEAR"
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
-
-    const-string v2, "phaseSeconds"
-    sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
+    const-string v2, "pulseKind"
+    invoke-virtual {v1, v2, p0}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
     invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
 
@@ -655,110 +615,20 @@
 .end method
 
 
-# Called from PipboyMenuMovie nav (via AndroidJavaClass). Pops bright now,
-# schedules a return to the resting level ~180ms later on the LED handler.
+# Called from PipboyMenuMovie nav (via AndroidJavaClass) — a brief pop.
 .method public static menuPulse()V
-    .registers 6
-
-    # bright pop (~200/255)
-    const/16 v0, 0xc8
-    invoke-static {v0}, Lio/pipboy/thor/LEDBridge;->pipboyAt(I)V
-
-    # (re)schedule the shared return to resting level after 180ms
-    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
-    sget-object v1, Lio/pipboy/thor/LEDBridge;->pulseReset:Lio/pipboy/thor/PulseReset;
-    if-eqz v0, :no_handler
-    if-eqz v1, :no_handler
-    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
-    const-wide/16 v2, 0xb4
-    invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
-
-    :no_handler
+    .registers 1
+    const-string v0, "PULSE"
+    invoke-static {v0}, Lio/pipboy/thor/LEDBridge;->sendPulse(Ljava/lang/String;)V
     return-void
 .end method
 
 
 # Called from PipboyPostEffect.TriggerVHold (via AndroidJavaClass) — the
-# dramatic vertical-hold "channel swap" roll. Scrambles the sticks with a
-# burst of TV static (Bifrost SPARKLE = random pixel flicker) for ~380ms,
-# then returns to the resting PIPBOY level via the shared reset.
+# dramatic vertical-hold "channel swap" roll → a TV-static scramble.
 .method public static staticBurst()V
-    .registers 8
-
-    # --- fire a SPARKLE override (the static scramble) ---
-    :try_start
-    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
-    if-eqz v0, :sent
-
-    new-instance v1, Landroid/content/Intent;
-    const-string v2, "com.moonbench.bifrost.api.ACTION_DISPLAY"
-    invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
-
-    new-instance v2, Landroid/content/ComponentName;
-    const-string v3, "com.moonbench.bifrost"
-    const-string v4, "com.moonbench.bifrost.external.ExternalApiReceiver"
-    invoke-direct {v2, v3, v4}, Landroid/content/ComponentName;-><init>(Ljava/lang/String;Ljava/lang/String;)V
-    invoke-virtual {v1, v2}, Landroid/content/Intent;->setComponent(Landroid/content/ComponentName;)Landroid/content/Intent;
-
-    const-string v2, "apiVersion"
-    const/4 v3, 0x1
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    const-string v2, "effect"
-    const-string v3, "SPARKLE"
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
-
-    # color = 0xFF00FF00 (green phosphor static)
-    const/high16 v5, -0x1000000
-    const/16 v6, 0xff
-    shl-int/lit8 v6, v6, 0x8
-    or-int v5, v5, v6
-    const-string v2, "color"
-    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-    const-string v2, "colorRight"
-    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    # bright + fast so it reads as a scramble
-    const-string v2, "intensity"
-    const/16 v3, 0xc8        # 200
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-    const-string v2, "intensityScale"
-    const/16 v3, 0xff
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-    const-string v2, "speed"
-    const/high16 v3, 0x3f800000    # 1.0f (fastest sparkle)
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
-
-    # high priority so it wins over any concurrent nav pop
-    const-string v2, "priority"
-    const/16 v3, 0x5a        # 90
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
-
-    const-string v2, "until"
-    const-string v3, "EXPLICIT_CLEAR"
-    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
-
-    invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
-
-    :sent
-    :try_end
-    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch
-
-    # --- (re)schedule the shared return ~380ms later (cancels any pending
-    #     shorter nav-pulse return so the static plays full length) ---
-    :after
-    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
-    sget-object v1, Lio/pipboy/thor/LEDBridge;->pulseReset:Lio/pipboy/thor/PulseReset;
-    if-eqz v0, :done
-    if-eqz v1, :done
-    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
-    const-wide/16 v2, 0x17c        # 380ms
-    invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
-
-    :done
+    .registers 1
+    const-string v0, "STATIC"
+    invoke-static {v0}, Lio/pipboy/thor/LEDBridge;->sendPulse(Ljava/lang/String;)V
     return-void
-
-    :catch
-    move-exception v0
-    goto :after
 .end method
