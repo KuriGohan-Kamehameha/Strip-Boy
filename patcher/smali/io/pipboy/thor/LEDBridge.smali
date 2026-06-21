@@ -61,6 +61,17 @@
 # colour change. Assumes game-time ≈ wall-clock since that change.
 .field private static pendingFBWall:J
 
+# Current screen flicker state (bFlickering of the visible PipboyPostEffect),
+# set by onFlickerToggle(). Sent to Bifrost as "flickering" so the plugin
+# turns its flicker shimmer on/off in lockstep — the flicker SCHEDULE is
+# event-driven (game triggers + multiple instances) and can't be seed-replayed.
+.field private static pendingFlickering:Z
+
+# elapsedRealtime ms of the most recent burst (TriggerBurst on the visible
+# instance), set by onBurst(). Sent as "burstWallMs"; the plugin runs a brief
+# flash envelope from this shared-clock anchor. 0 = no burst yet.
+.field private static pendingBurstWall:J
+
 # Dedupe — last (saturated r, g, b, alpha) successfully written.
 .field private static lastR:I
 .field private static lastG:I
@@ -302,6 +313,16 @@
     const-string v2, "phaseSeconds"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
 
+    # flickering = current screen flicker state (the plugin shimmers when true).
+    const-string v2, "flickering"
+    sget-boolean v3, Lio/pipboy/thor/LEDBridge;->pendingFlickering:Z
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Z)Landroid/content/Intent;
+
+    # burstWallMs = elapsedRealtime() of the last burst (plugin runs a flash).
+    const-string v2, "burstWallMs"
+    sget-wide v3, Lio/pipboy/thor/LEDBridge;->pendingBurstWall:J
+    invoke-virtual {v1, v2, v3, v4}, Landroid/content/Intent;->putExtra(Ljava/lang/String;J)Landroid/content/Intent;
+
     # activity.sendBroadcast(intent)
     invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
 
@@ -340,6 +361,53 @@
     invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
     invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
 
+    return-void
+.end method
+
+
+# Called from the Cecil-patched Update flicker toggle (FlickerSeed), gated to
+# the visible instance, whenever bFlickering flips. Feeds the new state so the
+# plugin turns its shimmer on/off in lockstep instead of replaying the
+# (game-triggered, multi-instance) flicker schedule. Immediate broadcast — the
+# flicker ON window is 0.1-0.6s, shorter than the 500ms heartbeat.
+.method public static onFlickerToggle(Z)V
+    .registers 4
+    .param p0, "flickering"
+
+    sput-boolean p0, Lio/pipboy/thor/LEDBridge;->pendingFlickering:Z
+
+    sget-boolean v0, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    if-eqz v0, :done
+
+    sget-object v2, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v3, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v2, v3}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v2, v3}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    :done
+    return-void
+.end method
+
+
+# Called from the Cecil-patched TriggerBurst (BurstFeed), gated to the visible
+# instance, on each burst flash. Stamps the wall-clock; the plugin runs a brief
+# flash envelope from this shared-clock anchor.
+.method public static onBurst()V
+    .registers 4
+
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+    move-result-wide v0
+    sput-wide v0, Lio/pipboy/thor/LEDBridge;->pendingBurstWall:J
+
+    sget-boolean v0, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    if-eqz v0, :done
+
+    sget-object v2, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v3, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v2, v3}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v2, v3}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    :done
     return-void
 .end method
 

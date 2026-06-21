@@ -50,7 +50,7 @@ IL_TXT="/tmp/regr-il.txt"
 : > "$IL_TXT"
 "$ILSPY" -il /tmp/regr-patched.dll -t PipboyPostEffect >> "$IL_TXT" 2>/dev/null || true
 "$ILSPY" -il /tmp/regr-patched.dll -t PipboyMenuMovie >> "$IL_TXT" 2>/dev/null || true
-for sym in _stripboyFTime _stripboyFlickerRange menuPulse staticBurst _stripboyLedBridgeCls; do
+for sym in _stripboyFlickerRange menuPulse staticBurst _stripboyLedBridgeCls _stripboyVisibleInstanceId onFlickerToggle onBurst; do
     if grep -q "$sym" "$IL_TXT"; then note "ok: injected '$sym' present"
     else note "FAIL: injected symbol '$sym' missing from patched DLL"; fail=1; fi
 done
@@ -58,7 +58,7 @@ rm -f "$IL_TXT"
 
 # 4. The Java/smali side defines the methods the Cecil hooks call.
 SMALI="patcher/smali/io/pipboy/thor/LEDBridge.smali"
-for m in 'sendPulse(Ljava/lang/String;)V' 'menuPulse()V' 'staticBurst()V' 'apply(IIIF)V'; do
+for m in 'sendPulse(Ljava/lang/String;)V' 'menuPulse()V' 'staticBurst()V' 'apply(IIIF)V' 'onFlickerToggle(Z)V' 'onBurst()V'; do
     if grep -q "$m" "$SMALI"; then note "ok: smali $m present"
     else note "FAIL: smali method '$m' missing from LEDBridge.smali"; fail=1; fi
 done

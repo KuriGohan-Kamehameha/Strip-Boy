@@ -164,6 +164,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
     ("FlickerSeed",               FlickerSeed.Apply),
+    ("BurstFeed",                 BurstFeed.Apply),
     ("MenuPulse",                 MenuPulse.Apply),
     // B disabled — on-device test 2026-06-21 affected the shader
     // (gradient banding less severe than the original Update-hook
@@ -364,10 +365,51 @@ static class FlickerSeed
         cil.InsertBefore(cret, cil.Create(OpCodes.Stsfld, vscanRngField));
         if (cctor.Body.MaxStackSize < 1) cctor.Body.MaxStackSize = 1;
 
+        // ---- re-seed both RNGs at the start of Awake ----
+        // fTime is monotonic within an instance (only ever += deltaTime; never
+        // reassigned), so it can only return to 0 on a FRESH PipboyPostEffect
+        // instance. These RNG fields are static — they outlive the instance — so
+        // without this, a new instance starts its fTime=0 schedule on the previous
+        // instance's advanced RNG state, desyncing from the plugin (which replays
+        // from seed whenever it re-anchors). Re-seeding on Awake makes every
+        // instance restart the seeded flicker/vscan schedule from scratch, exactly
+        // matching the plugin's setPhaseOrigin(0). fFlickerDelay (=5f) and fTime
+        // (=0) reset via their own field initializers in the instance ctor.
+        var awake = type.Methods.FirstOrDefault(m => m.Name == "Awake" && m.Parameters.Count == 0);
+        if (awake != null && awake.Body.Instructions.Count > 0)
+        {
+            var ail = awake.Body.GetILProcessor();
+            var afirst = awake.Body.Instructions.First();
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Ldc_I4, SEED));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Stsfld, rngField));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Ldc_I4, VSCAN_SEED));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Stsfld, vscanRngField));
+            // DIAGNOSTIC (remove after): log each Awake + instance id, to map the
+            // PipboyPostEffect lifecycle. If these fire mid-session (while SCRNFLK's
+            // fTime climbs continuously) a transient instance is re-seeding the
+            // shared RNG out from under the visible one — the residual-drift cause.
+            var unityRef2 = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+            var objType = new TypeReference("UnityEngine", "Object", module, unityRef2, valueType: false);
+            var getInstId = new MethodReference("GetInstanceID", module.TypeSystem.Int32, objType) { HasThis = true };
+            var dbgType = new TypeReference("UnityEngine", "Debug", module, unityRef2, valueType: false);
+            var dbgLog = new MethodReference("Log", module.TypeSystem.Void, dbgType);
+            dbgLog.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+            var concatOO = new MethodReference("Concat", module.TypeSystem.String, module.TypeSystem.String);
+            concatOO.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+            concatOO.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Ldstr, "STRIPBOY_AWAKE id="));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Ldarg_0));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Call, getInstId));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Box, module.TypeSystem.Int32));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Call, concatOO));
+            ail.InsertBefore(afirst, ail.Create(OpCodes.Call, dbgLog));
+            if (awake.Body.MaxStackSize < 2) awake.Body.MaxStackSize = 2;
+        }
+
         // ---- LCG range method builder: float Range(float lo, float hi) over
         //      the given seeded int field. Bit-identical to PipBoyAnimation's
         //      seededRange/vscanRange (value/2^32). ----
-        MethodDefinition BuildRange(string name, FieldDefinition rf)
+        MethodDefinition BuildRange(string name, FieldDefinition rf, string? logTag)
         {
             var m = new MethodDefinition(name,
                 MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
@@ -384,8 +426,32 @@ static class FlickerSeed
             il.Append(il.Create(OpCodes.Ldc_I4, LCG_ADD));
             il.Append(il.Create(OpCodes.Add));
             il.Append(il.Create(OpCodes.Stsfld, rf));
+            // DIAGNOSTIC (drop-proof RNG compare): log the post-advance state int,
+            // matched by VALUE against the plugin's PRNG sequence (immune to
+            // Unity Debug.Log drops). Flicker only — vscan passes logTag null.
+            if (logTag != null)
+            {
+                var uref = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+                var dt = new TypeReference("UnityEngine", "Debug", module, uref, valueType: false);
+                var dl = new MethodReference("Log", module.TypeSystem.Void, dt);
+                dl.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+                var cc = new MethodReference("Concat", module.TypeSystem.String, module.TypeSystem.String);
+                cc.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+                cc.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+                il.Append(il.Create(OpCodes.Ldstr, logTag));
+                il.Append(il.Create(OpCodes.Ldsfld, rf));
+                il.Append(il.Create(OpCodes.Box, module.TypeSystem.Int32));
+                il.Append(il.Create(OpCodes.Call, cc));
+                il.Append(il.Create(OpCodes.Call, dl));
+            }
             il.Append(il.Create(OpCodes.Ldsfld, rf));
-            il.Append(il.Create(OpCodes.Conv_U8));
+            // frac = (unsigned 32-bit)_rng / 2^32. conv.u8 alone is ambiguous
+            // for a negative int32 (it sign-extends to int64 first, blowing the
+            // value up to ~1.8e19); mask the low 32 bits explicitly so this
+            // matches the plugin's UInt.toDouble()/2^32 bit-for-bit.
+            il.Append(il.Create(OpCodes.Conv_I8));            // sign-extend int32 → int64
+            il.Append(il.Create(OpCodes.Ldc_I8, 0xFFFFFFFFL)); // mask low 32 bits
+            il.Append(il.Create(OpCodes.And));                // → 0 .. 2^32-1
             il.Append(il.Create(OpCodes.Conv_R8));
             il.Append(il.Create(OpCodes.Ldc_R8, 4294967296.0));
             il.Append(il.Create(OpCodes.Div));
@@ -407,8 +473,8 @@ static class FlickerSeed
             return m;
         }
 
-        var range = BuildRange("_stripboyFlickerRange", rngField);
-        var vrange = BuildRange("_stripboyVScanRange", vscanRngField);
+        var range = BuildRange("_stripboyFlickerRange", rngField, null);
+        var vrange = BuildRange("_stripboyVScanRange", vscanRngField, null);
 
         // ---- tee fTime: after `stfld fTime` near the top of Update ----
         var instrs = update.Body.Instructions;
@@ -464,40 +530,211 @@ static class FlickerSeed
         // Random.Range(min,max)) → seeded vscan RNG. Independent sequence so it
         // never perturbs the flicker draws.
         int vredirected = 0;
-        Instruction? vscanCall = null;
         for (int i = 0; i < toggleIdx; i++)
         {
             if (IsRandomRangeFF(instrs[i]))
             {
                 instrs[i].OpCode = OpCodes.Call;
                 instrs[i].Operand = vrange;
-                vscanCall = instrs[i];
                 vredirected++;
             }
         }
 
-        // DIAGNOSTIC (measure-only, remove after): log each screen vscan roll
-        // start so screen-vs-stick roll timing can be compared in logcat. The
-        // redirected vscan call fires exactly on a roll start; its float return
-        // stays on the stack across the Debug.Log(object) call, then the
-        // original stfld consumes it. Unity logcat tag = "Unity".
-        if (vscanCall != null)
+        // AndroidJavaClass refs (Unity 5 has no raw AndroidJNI — only this path)
+        // + cached class + visible-instance gate, shared by the flicker hook.
+        var ajcUnityRef = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass", module, ajcUnityRef, valueType: false);
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType) { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType) { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        // Reuse the cached AndroidJavaClass LEDStickBridge created (it patches
+        // first); create it if this patch ever runs standalone.
+        const string cachedFieldName = "_stripboyLedBridgeCls";
+        var cachedField = type.Fields.FirstOrDefault(f => f.Name == cachedFieldName);
+        if (cachedField is null)
         {
-            var unityRef2 = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
-            var debugType = new TypeReference("UnityEngine", "Debug", module, unityRef2, valueType: false);
-            var debugLog = new MethodReference("Log", module.TypeSystem.Void, debugType);
-            debugLog.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
-            var dil = update.Body.GetILProcessor();
-            var logStr = dil.Create(OpCodes.Ldstr, "STRIPBOY_VSCAN_ROLL");
-            var logCall = dil.Create(OpCodes.Call, debugLog);
-            dil.InsertAfter(vscanCall, logStr);
-            dil.InsertAfter(logStr, logCall);
-            if (update.Body.MaxStackSize < 8) update.Body.MaxStackSize = 8;
+            cachedField = new FieldDefinition(cachedFieldName,
+                FieldAttributes.Private | FieldAttributes.Static, ajcType);
+            type.Fields.Add(cachedField);
         }
 
+        var objTypeH = new TypeReference("UnityEngine", "Object", module, ajcUnityRef, valueType: false);
+        var getInstIdH = new MethodReference("GetInstanceID", module.TypeSystem.Int32, objTypeH) { HasThis = true };
+        var visibleIdFieldH = type.Fields.FirstOrDefault(f => f.Name == "_stripboyVisibleInstanceId")
+            ?? throw new Exception("_stripboyVisibleInstanceId missing — LEDStickBridge must patch before FlickerSeed");
+        var hil = update.Body.GetILProcessor();
+
+        // ---- flicker toggle feed: on each bFlickering flip (visible instance),
+        //      call LEDBridge.onFlickerToggle(bFlickering). Same event-feed model
+        //      as onVScanRoll — the flicker schedule can't be seed-replayed (game
+        //      triggers + multi-instance draws on the shared RNG), so feed the
+        //      actual on/off state. Injected after the stfld bFlickering (stack
+        //      empty); gated to the visible instance.
+        var flickerToggle = instrs.FirstOrDefault(i =>
+            i.OpCode == OpCodes.Stfld && i.Operand is FieldReference bf2 && bf2.Name == "bFlickering")
+            ?? throw new Exception("stfld bFlickering not found for flicker feed");
+        var bFlickeringRef = new FieldReference("bFlickering", module.TypeSystem.Boolean, type);
+        var afterFlicker = flickerToggle.Next
+            ?? throw new Exception("no instruction after bFlickering toggle");
+        var flCachedLoad = hil.Create(OpCodes.Ldsfld, cachedField);
+        var flickerHook = new List<Instruction>
+        {
+            // if (this.GetInstanceID() != _stripboyVisibleInstanceId) goto afterFlicker;
+            hil.Create(OpCodes.Ldarg_0),
+            hil.Create(OpCodes.Call, getInstIdH),
+            hil.Create(OpCodes.Ldsfld, visibleIdFieldH),
+            hil.Create(OpCodes.Bne_Un, afterFlicker),
+            // ensure cached AndroidJavaClass
+            hil.Create(OpCodes.Ldsfld, cachedField),
+            hil.Create(OpCodes.Brtrue, flCachedLoad),
+            hil.Create(OpCodes.Ldstr, "io.pipboy.thor.LEDBridge"),
+            hil.Create(OpCodes.Newobj, ajcCtor),
+            hil.Create(OpCodes.Stsfld, cachedField),
+            flCachedLoad,
+            // CallStatic("onFlickerToggle", new object[]{ (object)this.bFlickering })
+            hil.Create(OpCodes.Ldstr, "onFlickerToggle"),
+            hil.Create(OpCodes.Ldc_I4_1),
+            hil.Create(OpCodes.Newarr, module.TypeSystem.Object),
+            hil.Create(OpCodes.Dup),
+            hil.Create(OpCodes.Ldc_I4_0),
+            hil.Create(OpCodes.Ldarg_0),
+            hil.Create(OpCodes.Ldfld, bFlickeringRef),
+            hil.Create(OpCodes.Box, module.TypeSystem.Boolean),
+            hil.Create(OpCodes.Stelem_Ref),
+            hil.Create(OpCodes.Callvirt, callStatic),
+        };
+        Instruction flPrev = flickerToggle;
+        foreach (var ins in flickerHook) { hil.InsertAfter(flPrev, ins); flPrev = ins; }
+
+        if (update.Body.MaxStackSize < 8) update.Body.MaxStackSize = 8;
+
         return new(true,
-            $"PipboyPostEffect seeded: {redirected} flicker + {vredirected} vscan "
-          + $"Random.Range call(s) redirected; tee'd fTime → _stripboyFTime");
+            $"PipboyPostEffect: {redirected} flicker + {vredirected} vscan "
+          + $"Random.Range redirected; onFlickerToggle hook installed (visible instance)");
+    }
+}
+
+// BurstFeed — feeds LEDBridge.onBurst() from PipboyPostEffect.TriggerBurst, so
+// the plugin flashes when the screen bursts. TriggerBurst is the single funnel
+// for all bursts (the Update 15%-roll AND game-triggered Large/SmallBurst), so
+// hooking it catches every flash. Gated to the visible instance (id recorded by
+// LEDStickBridge). Event-driven (~rare), reuses the apply() JNI path.
+static class BurstFeed
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+        var method = type.Methods.FirstOrDefault(m =>
+            m.Name == "TriggerBurst" && m.Parameters.Count == 2)
+            ?? throw new Exception("PipboyPostEffect::TriggerBurst(float,float) not found");
+        if (method.Body.Instructions.Any(i =>
+            i.OpCode == OpCodes.Ldstr && (i.Operand as string) == "onBurst"))
+            return new(false, "BurstFeed already installed");
+
+        var unityRef = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass", module, unityRef, valueType: false);
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType) { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType) { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+        var objType = new TypeReference("UnityEngine", "Object", module, unityRef, valueType: false);
+        var getInstId = new MethodReference("GetInstanceID", module.TypeSystem.Int32, objType) { HasThis = true };
+        var visibleIdField = type.Fields.FirstOrDefault(f => f.Name == "_stripboyVisibleInstanceId")
+            ?? throw new Exception("_stripboyVisibleInstanceId missing — LEDStickBridge must patch before BurstFeed");
+        var cachedField = type.Fields.FirstOrDefault(f => f.Name == "_stripboyLedBridgeCls")
+            ?? throw new Exception("_stripboyLedBridgeCls missing — LEDStickBridge must patch before BurstFeed");
+
+        var il = method.Body.GetILProcessor();
+        var ret = method.Body.Instructions.FirstOrDefault(i => i.OpCode == OpCodes.Ret)
+            ?? throw new Exception("TriggerBurst has no ret");
+        var cachedLoad = il.Create(OpCodes.Ldsfld, cachedField);
+        var seq = new List<Instruction>
+        {
+            // if (this.GetInstanceID() != _stripboyVisibleInstanceId) return;
+            il.Create(OpCodes.Ldarg_0),
+            il.Create(OpCodes.Call, getInstId),
+            il.Create(OpCodes.Ldsfld, visibleIdField),
+            il.Create(OpCodes.Bne_Un, ret),
+            il.Create(OpCodes.Ldsfld, cachedField),
+            il.Create(OpCodes.Brtrue, cachedLoad),
+            il.Create(OpCodes.Ldstr, "io.pipboy.thor.LEDBridge"),
+            il.Create(OpCodes.Newobj, ajcCtor),
+            il.Create(OpCodes.Stsfld, cachedField),
+            cachedLoad,
+            il.Create(OpCodes.Ldstr, "onBurst"),
+            il.Create(OpCodes.Ldc_I4_0),
+            il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+            il.Create(OpCodes.Callvirt, callStatic),
+        };
+        foreach (var ins in seq) il.InsertBefore(ret, ins);
+        if (method.Body.MaxStackSize < 4) method.Body.MaxStackSize = 4;
+        return new(true, "PipboyPostEffect::TriggerBurst now feeds LEDBridge.onBurst() (visible instance)");
+    }
+}
+
+// FlickerToggleLog — DIAGNOSTIC. Logs "SCRNFLK <fTime>" via Unity Debug.Log
+// each time PipboyPostEffect.Update flips bFlickering. Paired with the
+// plugin's PLUGFLK log, this is a hard yes/no on whether the seeded flicker
+// schedules are bit-matched: if SCRNFLK and PLUGFLK fire at the same fTime /
+// logcat instant, they're in lockstep. Low-rate (toggles ~every 5-15s), safe
+// (Unity logging, no per-frame JNI). Remove once the question is answered.
+static class FlickerToggleLog
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+        var update = type.Methods.FirstOrDefault(m =>
+            m.Name == "Update" && m.Parameters.Count == 0)
+            ?? throw new Exception("PipboyPostEffect::Update() not found");
+
+        var instrs = update.Body.Instructions;
+        // Idempotence: our injected ldstr "SCRNFLK " marks it.
+        if (instrs.Any(i => i.OpCode == OpCodes.Ldstr && (i.Operand as string) == "SCRNFLK "))
+            return new(false, "FlickerToggleLog already installed");
+
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var debugType = new TypeReference("UnityEngine", "Debug", module, unityRef, valueType: false);
+        var debugLog = new MethodReference("Log", module.TypeSystem.Void, debugType);
+        debugLog.Parameters.Add(new ParameterDefinition(module.TypeSystem.Object));
+
+        var fTimeRef = new FieldReference("fTime", module.TypeSystem.Single, type);
+        var bFlickRef = new FieldReference("bFlickering", module.TypeSystem.Boolean, type);
+        // Single.ToString() — instance method, needs the field address (ldflda).
+        var singleToString = new MethodReference("ToString", module.TypeSystem.String, module.TypeSystem.Single)
+            { HasThis = true };
+        // String.Concat(string, string) — static.
+        var concat = new MethodReference("Concat", module.TypeSystem.String, module.TypeSystem.String);
+        concat.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        concat.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        // Find the bFlickering toggle (stfld bFlickering) in Update.
+        Instruction? toggle = instrs.FirstOrDefault(i =>
+            i.OpCode == OpCodes.Stfld && i.Operand is FieldReference fr && fr.Name == "bFlickering");
+        if (toggle is null) throw new Exception("stfld bFlickering not found in Update");
+
+        var il = update.Body.GetILProcessor();
+        // Debug.Log(string.Concat("SCRNFLK ", this.fTime.ToString()));
+        var seq = new[]
+        {
+            il.Create(OpCodes.Ldstr, "SCRNFLK "),
+            il.Create(OpCodes.Ldarg_0),
+            il.Create(OpCodes.Ldflda, fTimeRef),
+            il.Create(OpCodes.Call, singleToString),
+            il.Create(OpCodes.Call, concat),
+            il.Create(OpCodes.Call, debugLog),
+        };
+        var cursor = toggle;
+        foreach (var ins in seq) { il.InsertAfter(cursor, ins); cursor = ins; }
+
+        if (update.Body.MaxStackSize < 3) update.Body.MaxStackSize = 3;
+        return new(true, "PipboyPostEffect::Update logs SCRNFLK <fTime> on each bFlickering toggle");
     }
 }
 
@@ -1873,6 +2110,23 @@ static class LEDStickBridge
             type.Fields.Add(cachedField);
         }
 
+        // Visible-instance binding. PipboyPostEffect.Update runs on EVERY live
+        // instance (boot/loopback effects included), but SetColor fires on the
+        // one the user sees. Record its id so the vscan roll hook (FlickerSeed,
+        // in Update) fires only for the visible instance — otherwise a background
+        // instance running ahead leads the LED bar (same class of bug the
+        // this.fTime phase feed fixes for the flicker clock).
+        const string visibleIdFieldName = "_stripboyVisibleInstanceId";
+        var visibleIdField = type.Fields.FirstOrDefault(f => f.Name == visibleIdFieldName);
+        if (visibleIdField is null)
+        {
+            visibleIdField = new FieldDefinition(visibleIdFieldName,
+                FieldAttributes.Private | FieldAttributes.Static, module.TypeSystem.Int32);
+            type.Fields.Add(visibleIdField);
+        }
+        var objTypeVis = new TypeReference("UnityEngine", "Object", module, unityRef, valueType: false);
+        var getInstIdVis = new MethodReference("GetInstanceID", module.TypeSystem.Int32, objTypeVis) { HasThis = true };
+
         var body = method.Body;
         var il = body.GetILProcessor();
         var finalRet = body.Instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
@@ -1920,19 +2174,32 @@ static class LEDStickBridge
             seq.Add(il.Create(OpCodes.Stelem_Ref));
         }
 
-        // arr[3] = PipboyPostEffect._stripboyFTime (the screen's elapsed flicker
-        // clock, tee'd by FlickerSeed). LEDBridge forwards it to Bifrost as
-        // "phaseSeconds" so the plugin fast-forwards its seeded flicker sim to
-        // the screen's exact state. Falls back to 0 if FlickerSeed isn't applied
-        // (the field still exists as a static; default 0 just means "start now").
-        var fTimeRef = new FieldReference("_stripboyFTime", module.TypeSystem.Single, type);
+        // arr[3] = this.fTime — the elapsed flicker clock of the SAME instance
+        // whose colour just changed (the visible Pip-Boy). The shared static
+        // _stripboyFTime was clobbered every frame by ANY live PipboyPostEffect's
+        // Update tee, so a boot/loopback effect running ahead of the on-screen one
+        // poisoned the phase feed (measured: a constant ~15s lead → flicker never
+        // lined up). Reading this.fTime binds the feed to the instance the user
+        // actually sees. LEDBridge forwards it to Bifrost as "phaseSeconds" so the
+        // plugin fast-forwards its seeded flicker sim to the screen's exact state.
+        var fTimeRef = new FieldReference("fTime", module.TypeSystem.Single, type);
         seq.Add(il.Create(OpCodes.Dup));
         seq.Add(il.Create(OpCodes.Ldc_I4_3));
-        seq.Add(il.Create(OpCodes.Ldsfld, fTimeRef));
+        seq.Add(il.Create(OpCodes.Ldarg_0));
+        seq.Add(il.Create(OpCodes.Ldfld, fTimeRef));
         seq.Add(il.Create(OpCodes.Box, module.TypeSystem.Single));
         seq.Add(il.Create(OpCodes.Stelem_Ref));
 
         seq.Add(il.Create(OpCodes.Callvirt, callStatic));
+
+        // Record this (visible) instance's id before the apply() relay, so the
+        // vscan roll hook can gate on it.
+        seq.InsertRange(0, new[]
+        {
+            il.Create(OpCodes.Ldarg_0),
+            il.Create(OpCodes.Call, getInstIdVis),
+            il.Create(OpCodes.Stsfld, visibleIdField),
+        });
 
         foreach (var i in seq)
             il.InsertBefore(finalRet, i);
