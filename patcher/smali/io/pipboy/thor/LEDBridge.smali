@@ -35,6 +35,27 @@
 # debuggable without spewing 30 Hz log lines under per-frame drive.
 .field private static loggedOnce:Z
 
+# Dedupe cache. Update is called every frame (30-60 Hz) by Unity,
+# but most frames repeat the same (r,g,b,alpha). Skipping the
+# two FileOutputStream+JNI writes when nothing changed cuts the
+# per-frame cost to four int compares — keeps the screen rendering
+# from stuttering while still letting flicker (which DOES change
+# alpha frame-to-frame) propagate.
+.field private static lastR:I
+.field private static lastG:I
+.field private static lastB:I
+.field private static lastAlpha:I
+
+.method static constructor <clinit>()V
+    .registers 1
+    const/4 v0, -0x1
+    sput v0, Lio/pipboy/thor/LEDBridge;->lastR:I
+    sput v0, Lio/pipboy/thor/LEDBridge;->lastG:I
+    sput v0, Lio/pipboy/thor/LEDBridge;->lastB:I
+    sput v0, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+    return-void
+.end method
+
 
 .method public static apply(IIIF)V
     .registers 14
@@ -99,13 +120,61 @@
     move-result v5
     float-to-int v5, v5
 
-    # writeStick(idx=1, r, g, b, alpha) — left chip
-    const/4 v2, 0x1
-    invoke-static {v2, p0, p1, p2, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+    # Saturation pass: strip the white component, rescale so max
+    # channel = 255. Pip-Boy's shader picks a tint that can read
+    # quite washed-out on the LEDs (e.g. (200, 230, 200) reads as
+    # near-white) — but subtracting min and renormalising gives the
+    # pure hue. Pure grey/white inputs end up as (0, 0, 0): off.
+    # That's correct — there's no hue to display.
+    #
+    # v6, v7, v8 = saturated r, g, b
+    # v9 = min channel; reused as max channel
+    invoke-static {p0, p1}, Ljava/lang/Math;->min(II)I
+    move-result v9
+    invoke-static {v9, p2}, Ljava/lang/Math;->min(II)I
+    move-result v9
+    sub-int v6, p0, v9
+    sub-int v7, p1, v9
+    sub-int v8, p2, v9
+    invoke-static {v6, v7}, Ljava/lang/Math;->max(II)I
+    move-result v9
+    invoke-static {v9, v8}, Ljava/lang/Math;->max(II)I
+    move-result v9
+    if-eqz v9, :sat_done
+    mul-int/lit16 v6, v6, 0xff
+    div-int v6, v6, v9
+    mul-int/lit16 v7, v7, 0xff
+    div-int v7, v7, v9
+    mul-int/lit16 v8, v8, 0xff
+    div-int v8, v8, v9
+    :sat_done
 
-    # writeStick(idx=2, r, g, b, alpha) — right chip
+    # Dedupe gate: if (sat_r, sat_g, sat_b, alpha) match the last
+    # successful write, the LEDs already show this state — skip the
+    # two FileOutputStream writes. Cuts steady-state cost to four
+    # int compares; flicker still propagates because alpha changes.
+    sget v9, Lio/pipboy/thor/LEDBridge;->lastR:I
+    if-ne v6, v9, :dirty
+    sget v9, Lio/pipboy/thor/LEDBridge;->lastG:I
+    if-ne v7, v9, :dirty
+    sget v9, Lio/pipboy/thor/LEDBridge;->lastB:I
+    if-ne v8, v9, :dirty
+    sget v9, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+    if-eq v5, v9, :done
+
+    :dirty
+    sput v6, Lio/pipboy/thor/LEDBridge;->lastR:I
+    sput v7, Lio/pipboy/thor/LEDBridge;->lastG:I
+    sput v8, Lio/pipboy/thor/LEDBridge;->lastB:I
+    sput v5, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+
+    # writeStick(idx=1, sat_r, sat_g, sat_b, alpha) — left chip
+    const/4 v2, 0x1
+    invoke-static {v2, v6, v7, v8, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+
+    # writeStick(idx=2, sat_r, sat_g, sat_b, alpha) — right chip
     const/4 v2, 0x2
-    invoke-static {v2, p0, p1, p2, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+    invoke-static {v2, v6, v7, v8, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
 
     :done
     :try_end
