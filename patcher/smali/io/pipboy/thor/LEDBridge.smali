@@ -69,6 +69,12 @@
 # the renderer-thread loop and contention is resolved cooperatively.
 .field private static dispatchMode:I
 
+# Whether the Bifrost keep-alive heartbeat loop has been started. The
+# heartbeat re-sends ACTION_DISPLAY every 2s so Bifrost's lease watchdog
+# keeps the override alive; when this process dies the loop stops and
+# Bifrost cleanly reverts.
+.field private static heartbeatStarted:Z
+
 
 .method static constructor <clinit>()V
     .registers 5
@@ -133,8 +139,20 @@
     const/4 v5, 0x2
     if-ne v4, v5, :sysfs_path
 
-    # Bifrost path — ACTION_DISPLAY broadcast (Bifrost renders the effect).
+    # Bifrost path — immediate ACTION_DISPLAY broadcast for responsiveness...
     invoke-static {p0, p1, p2}, Lio/pipboy/thor/LEDBridge;->sendBifrostDisplay(III)V
+
+    # ...and ensure the keep-alive heartbeat loop is running (start once).
+    sget-boolean v4, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    if-nez v4, :hb_running
+    const/4 v4, 0x1
+    sput-boolean v4, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    const-wide/16 v2, 0x7d0      # 2000ms heartbeat interval
+    invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
+
+    :hb_running
     return-void
 
     :sysfs_path
@@ -313,6 +331,26 @@
 .method public run()V
     .registers 16
 
+    # Bifrost keep-alive heartbeat branch: in Bifrost mode this Runnable is
+    # the lease-renewal loop, not the sysfs writer. Re-send the latest colour
+    # and re-post in 2s; when this process dies the loop stops and Bifrost's
+    # watchdog reverts. sendBifrostDisplay is self-guarded.
+    sget v0, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    const/4 v1, 0x2
+    if-ne v0, v1, :sysfs_writer
+
+    sget v0, Lio/pipboy/thor/LEDBridge;->pendingR:I
+    sget v1, Lio/pipboy/thor/LEDBridge;->pendingG:I
+    sget v2, Lio/pipboy/thor/LEDBridge;->pendingB:I
+    invoke-static {v0, v1, v2}, Lio/pipboy/thor/LEDBridge;->sendBifrostDisplay(III)V
+
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    const-wide/16 v2, 0x7d0      # 2000ms
+    invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
+    return-void
+
+    :sysfs_writer
     :try_start
     # Read pending snapshot.
     sget v0, Lio/pipboy/thor/LEDBridge;->pendingR:I
