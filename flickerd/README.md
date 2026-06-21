@@ -8,7 +8,7 @@ By moving the LED tick loop into a separate APK with its own process, **the LED 
 
 ## Status
 
-**EXPERIMENTAL / DRAFT.** Sources compile cleanly in theory but haven't been built or run against a device yet. See `docs/FLICKER_EXPERIMENTS.md` for the full investigation context — flickerd is Experiment C, the fallback path if Experiments A1/A2 (zero-allocation in-process JNI) fail.
+**BUILT, NOT YET DEVICE-VERIFIED.** Sources compile clean (verified on JDK 26 + Android build-tools 36.0.0) and the build pipeline produces a valid 12.7 KB APK with correct manifest, signed dex, and proper foreground-service declarations. Hasn't been installed or run against a Thor yet — that's what you'll do when you wake up. See `docs/FLICKER_EXPERIMENTS.md` for the full investigation context — flickerd is Experiment C, the fallback path if Experiments A1/A2 (zero-allocation in-process JNI) fail.
 
 ## What it does
 

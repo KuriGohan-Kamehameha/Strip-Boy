@@ -67,7 +67,8 @@ echo "[flickerd] keystore:    $KEYSTORE"
 # --- 1. javac -----------------------------------------------------------
 echo "[flickerd] 1/5  javac"
 find src -name '*.java' > "$OUT/sources.txt"
-javac -source 1.8 -target 1.8 -bootclasspath "$ANDROID_JAR" \
+javac -source 1.8 -target 1.8 -Xlint:-options \
+    -classpath "$ANDROID_JAR" \
     -d "$OUT/classes" @"$OUT/sources.txt"
 
 # --- 2. d8 → dex --------------------------------------------------------

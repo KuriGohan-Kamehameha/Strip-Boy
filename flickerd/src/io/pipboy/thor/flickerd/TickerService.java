@@ -136,13 +136,10 @@ public class TickerService extends Service {
         double mult = Math.min(1.0, pulse * flicker);
 
         // -- scale RGB to target_max ----------------------------------------
-        int bottom;
-        try {
-            bottom = Settings.System.getInt(getContentResolver(),
-                "dual_screen_brightness_level", 50);
-        } catch (Settings.SettingNotFoundException e) {
-            bottom = 50;
-        }
+        // The 3-arg getInt() doesn't throw — it returns the fallback (50)
+        // when the setting is missing.
+        int bottom = Settings.System.getInt(getContentResolver(),
+            "dual_screen_brightness_level", 50);
         // target_max = bottom * 0.1275 (5% PWM × screen brightness)
         double targetMax = bottom * 0.1275 * mult;
 

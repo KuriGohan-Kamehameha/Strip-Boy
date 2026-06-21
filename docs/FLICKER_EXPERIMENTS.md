@@ -734,6 +734,7 @@ do in `SetColor`'s tail. Doesn't risk the shader.
 | 3 | Sketched A2 Cecil (zero-alloc JNI via jvalue[]) and C (sidekick APK skeleton). Doc committed. |
 | 4 | Materialized `flickerd/` as buildable directory (~520 LOC, ~10 KB APK). |
 | 5 | Wrote Strip-Boy-side smali dispatcher: auto-detects flickerd via PackageManager, chooses broadcast vs sysfs. End-to-end C path is now fully spec'd. |
+| 6 | Audit pass — actually ran `flickerd/scripts/build.sh` against JDK 26 + Android SDK build-tools 36.0.0. Caught two real bugs: (1) dead `catch (SettingNotFoundException)` on the 3-arg `Settings.System.getInt` overload (Java rejects "exception never thrown in body" as an error); removed the catch. (2) deprecated `-bootclasspath` produced 3 warnings on JDK 26 — switched to `-classpath` + `-Xlint:-options`. Build now produces a valid 12,715-byte signed APK (verified manifest, classes.dex, V1 signature). Ready to `adb install`. |
 
 Pick-order when at the keyboard: **A1 → A2 → C**. A1 takes 5 min and
 disambiguates the entire investigation.
