@@ -30,13 +30,26 @@ def main(path: str) -> int:
         print("ERROR: no <application> element", file=sys.stderr)
         return 2
 
-    # Detect already-patched state.
-    for activity in app.findall("activity"):
-        if activity.get(NAME_ATTR) == LAUNCHER_FQN:
-            print(f"skip: {LAUNCHER_FQN} already present in manifest")
-            return 0
+    # Independent idempotence — the launcher and Bifrost integration can
+    # land at different times (e.g. someone adds the permission to an
+    # already-launcher-patched extraction). Each phase no-ops if its
+    # marker is already present.
+    launcher_already = any(
+        a.get(NAME_ATTR) == LAUNCHER_FQN for a in app.findall("activity"))
 
-    # 1. Strip launcher intent-filter from UnityPlayerNativeActivity.
+    if launcher_already:
+        print(f"skip: {LAUNCHER_FQN} already present in manifest")
+    else:
+        _patch_launcher(app)
+
+    _patch_bifrost_integration(root)
+
+    tree.write(path, xml_declaration=True, encoding="utf-8")
+    return 0
+
+
+def _patch_launcher(app):
+    """1. Strip launcher intent-filter from UnityPlayerNativeActivity."""
     unity_activity = None
     for activity in app.findall("activity"):
         if activity.get(NAME_ATTR) == UNITY_FQN:
@@ -79,9 +92,37 @@ def main(path: str) -> int:
     cat2 = ET.SubElement(filt, "category")
     cat2.set(NAME_ATTR, "android.intent.category.LEANBACK_LAUNCHER")
 
-    tree.write(path, xml_declaration=True, encoding="utf-8")
     print(f"patched: stripped {removed} launcher intent-filter(s) from {UNITY_FQN}, added {LAUNCHER_FQN}")
-    return 0
+
+
+def _patch_bifrost_integration(root):
+    """Add CONTROL_LEDS permission + <queries> block (idempotent)."""
+    bifrost_perm = "com.moonbench.bifrost.permission.CONTROL_LEDS"
+    bifrost_pkg = "com.moonbench.bifrost"
+
+    perm_added = False
+    if not any(p.get(NAME_ATTR) == bifrost_perm for p in root.findall("uses-permission")):
+        perm = ET.Element("uses-permission")
+        perm.set(NAME_ATTR, bifrost_perm)
+        root.insert(0, perm)
+        perm_added = True
+
+    pkg_added = False
+    queries = root.find("queries")
+    if queries is None:
+        queries = ET.SubElement(root, "queries")
+    if not any(p.get(NAME_ATTR) == bifrost_pkg for p in queries.findall("package")):
+        pkg = ET.SubElement(queries, "package")
+        pkg.set(NAME_ATTR, bifrost_pkg)
+        pkg_added = True
+
+    if perm_added or pkg_added:
+        bits = []
+        if perm_added: bits.append("CONTROL_LEDS")
+        if pkg_added:  bits.append("<queries package=bifrost>")
+        print(f"patched: Bifrost integration — {', '.join(bits)}")
+    else:
+        print("skip: Bifrost integration already present")
 
 
 if __name__ == "__main__":

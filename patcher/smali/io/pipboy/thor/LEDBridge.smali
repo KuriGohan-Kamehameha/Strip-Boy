@@ -63,6 +63,12 @@
 # One-shot diagnostic flag — log first successful write only.
 .field private static loggedOnce:Z
 
+# Bifrost dispatch mode: 0 = unknown, 1 = sysfs fallback, 2 = Bifrost API.
+# Lazily detected on first apply() call. If Bifrost is installed, all
+# colour updates flow through ACTION_DISPLAY broadcasts; Bifrost owns
+# the renderer-thread loop and contention is resolved cooperatively.
+.field private static dispatchMode:I
+
 
 .method static constructor <clinit>()V
     .registers 5
@@ -105,7 +111,7 @@
 # background writer. Coalesces queued posts so the writer always
 # operates on the latest values.
 .method public static apply(IIIF)V
-    .registers 5
+    .registers 7
     .param p0, "r"
     .param p1, "g"
     .param p2, "b"
@@ -116,11 +122,151 @@
     sput p2, Lio/pipboy/thor/LEDBridge;->pendingB:I
     sput p3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
 
+    # Lazy-detect whether Bifrost is installed; cache the verdict.
+    sget v4, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    if-nez v4, :have_mode
+    invoke-static {}, Lio/pipboy/thor/LEDBridge;->detectDispatchMode()I
+    move-result v4
+    sput v4, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+
+    :have_mode
+    const/4 v5, 0x2
+    if-ne v4, v5, :sysfs_path
+
+    # Bifrost path — ACTION_DISPLAY broadcast (Bifrost renders the effect).
+    invoke-static {p0, p1, p2}, Lio/pipboy/thor/LEDBridge;->sendBifrostDisplay(III)V
+    return-void
+
+    :sysfs_path
     sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
     sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
     invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
     invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
 
+    return-void
+.end method
+
+
+# Returns 1 (sysfs fallback) or 2 (Bifrost ACTION_DISPLAY).
+.method private static detectDispatchMode()I
+    .registers 5
+
+    :try_start
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v0, :default_sysfs
+    invoke-virtual {v0}, Landroid/content/Context;->getPackageManager()Landroid/content/pm/PackageManager;
+    move-result-object v1
+    const-string v2, "com.moonbench.bifrost"
+    const/4 v3, 0x0
+    invoke-virtual {v1, v2, v3}, Landroid/content/pm/PackageManager;->getPackageInfo(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;
+    # No exception → Bifrost installed
+    const-string v0, "strip-boy"
+    const-string v1, "dispatch = Bifrost API (com.moonbench.bifrost detected)"
+    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    const/4 v0, 0x2
+    return v0
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch_default
+
+    :catch_default
+    move-exception v0
+    :default_sysfs
+    const-string v0, "strip-boy"
+    const-string v1, "dispatch = sysfs (Bifrost not installed)"
+    invoke-static {v0, v1}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    const/4 v0, 0x1
+    return v0
+.end method
+
+
+# Send an ACTION_DISPLAY broadcast to Bifrost's ExternalApiReceiver.
+# Effect = SPARKLE (random pixel flicker — the Pip-Boy CRT vibe).
+# Colour packed as 0xFF000000 | (r<<16) | (g<<8) | b — alpha is full.
+# Intensity scaled to 5% via intensityScale=2000 trick (we send 100 on
+# a 0..2000 scale → ~12.75/255 final, matching the original sysfs cap).
+# Priority 60. until=UNTIL_EXPLICIT_CLEAR so it persists.
+.method private static sendBifrostDisplay(III)V
+    .registers 10
+    .param p0, "r"
+    .param p1, "g"
+    .param p2, "b"
+
+    :try_start
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v0, :done
+
+    # intent = new Intent("com.moonbench.bifrost.api.ACTION_DISPLAY")
+    new-instance v1, Landroid/content/Intent;
+    const-string v2, "com.moonbench.bifrost.api.ACTION_DISPLAY"
+    invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
+
+    # intent.setComponent(new ComponentName("com.moonbench.bifrost",
+    #   "com.moonbench.bifrost.external.ExternalApiReceiver"))
+    new-instance v2, Landroid/content/ComponentName;
+    const-string v3, "com.moonbench.bifrost"
+    const-string v4, "com.moonbench.bifrost.external.ExternalApiReceiver"
+    invoke-direct {v2, v3, v4}, Landroid/content/ComponentName;-><init>(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-virtual {v1, v2}, Landroid/content/Intent;->setComponent(Landroid/content/ComponentName;)Landroid/content/Intent;
+
+    # putExtra("apiVersion", 1)
+    const-string v2, "apiVersion"
+    const/4 v3, 0x1
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    # putExtra("effect", "SPARKLE")
+    const-string v2, "effect"
+    const-string v3, "SPARKLE"
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+
+    # color = 0xFF000000 | (r<<16) | (g<<8) | b
+    const/high16 v5, -0x1000000      # 0xFF000000 (signed alpha byte)
+    shl-int/lit8 v6, p0, 0x10
+    or-int v5, v5, v6
+    shl-int/lit8 v6, p1, 0x8
+    or-int v5, v5, v6
+    or-int v5, v5, p2
+    const-string v2, "color"
+    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "colorRight"
+    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    # intensity = 100 on intensityScale = 2000 (~5% of 255 = 12.75)
+    const-string v2, "intensity"
+    const/16 v3, 0x64        # 100
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "intensityScale"
+    const/16 v3, 0x7d0       # 2000
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    # speed = 0.7f (lively but not seizure-inducing)
+    const-string v2, "speed"
+    const v3, 0x3f333333      # 0.7f
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
+
+    # priority = 60
+    const-string v2, "priority"
+    const/16 v3, 0x3c
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    # until = "EXPLICIT_CLEAR"
+    const-string v2, "until"
+    const-string v3, "EXPLICIT_CLEAR"
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+
+    # activity.sendBroadcast(intent)
+    invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
+
+    :done
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch
+
+    return-void
+
+    :catch
+    move-exception v0
+    const-string v1, "strip-boy"
+    const-string v2, "sendBifrostDisplay threw"
+    invoke-static {v1, v2, v0}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
     return-void
 .end method
 
