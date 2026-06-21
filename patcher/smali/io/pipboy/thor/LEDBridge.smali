@@ -139,7 +139,12 @@
     sget v2, Lio/pipboy/thor/LEDBridge;->pendingB:I
     sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
 
-    # Saturation: subtract min channel, rescale max=255.
+    # Saturation: subtract min channel. (Don't rescale to max=255 yet —
+    # we now scale to `target_max` below, since the kernel driver
+    # IGNORES the 4th alpha field and brightness is entirely a
+    # function of RGB magnitudes. Verified empirically: writing
+    # (0,255,0):5 and (0,255,0):255 produce identical brightness;
+    # writing (0,15,0):255 is properly dim.)
     invoke-static {v0, v1}, Ljava/lang/Math;->min(II)I
     move-result v4
     invoke-static {v4, v2}, Ljava/lang/Math;->min(II)I
@@ -151,19 +156,12 @@
     move-result v4
     invoke-static {v4, v7}, Ljava/lang/Math;->max(II)I
     move-result v4
-    if-eqz v4, :sat_done
-    mul-int/lit16 v5, v5, 0xff
-    div-int v5, v5, v4
-    mul-int/lit16 v6, v6, 0xff
-    div-int v6, v6, v4
-    mul-int/lit16 v7, v7, 0xff
-    div-int v7, v7, v4
-    :sat_done
+    # v5, v6, v7 = sat channels (max=v4); v4 = sat_max
 
     # Need ContentResolver for bottom-screen brightness lookup.
-    sget-object v4, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
-    if-eqz v4, :done
-    invoke-virtual {v4}, Landroid/content/Context;->getContentResolver()Landroid/content/ContentResolver;
+    sget-object v8, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v8, :done
+    invoke-virtual {v8}, Landroid/content/Context;->getContentResolver()Landroid/content/ContentResolver;
     move-result-object v8
 
     # bottom = Settings.System.getInt(cr, "dual_screen_brightness_level", 50);
@@ -177,10 +175,10 @@
     invoke-static {v3, v9}, Ljava/lang/Math;->min(FF)F
     move-result v3
 
-    # alpha_f = (float)bottom * fB_clamped * 0.1275
-    # 0.1275 = 0.05 × 2.55 (5% LED-PWM ceiling × 255/100).
-    # At bottom=100, fB=1.0 → alpha = 12.75 ≈ 12 (5% PWM).
-    # At bottom=44,  fB=1.0 → alpha = 5.6  ≈ 5  (2% PWM).
+    # target_max_f = (float)bottom * fB_clamped * 0.1275
+    # 0.1275 = 0.05 × 2.55  (5% RGB ceiling × 255/100).
+    # At bottom=100, fB=1.0 → target_max = 12  (max-channel value)
+    # At bottom=44,  fB=1.0 → target_max = 5
     int-to-float v9, v8
     mul-float v9, v9, v3
     const v10, 0x3e028f5c              # 0.1275f
@@ -196,24 +194,34 @@
     invoke-static {v9, v10}, Ljava/lang/Math;->max(FF)F
     move-result v9
     float-to-int v9, v9
+    # v9 = target_max (integer 0..255, typically small — 5..12)
 
-    # Dedupe — skip the two sysfs writes if (sat_r, sat_g, sat_b, alpha)
-    # matches the last successful write. Steady-state collapses to
-    # four int compares per Update call.
+    # Scale saturated channels TO target_max. After this, max(v5,v6,v7) = v9.
+    # If sat_max == 0 (input was pure grey/white), output stays (0,0,0).
+    if-eqz v4, :scale_done
+    mul-int v5, v5, v9
+    div-int v5, v5, v4
+    mul-int v6, v6, v9
+    div-int v6, v6, v4
+    mul-int v7, v7, v9
+    div-int v7, v7, v4
+    :scale_done
+
+    # Dedupe — skip the two sysfs writes if (r, g, b) matches the last
+    # successful write. Alpha is constant (255, ignored by the kernel
+    # driver) so it doesn't participate in the compare.
     sget v10, Lio/pipboy/thor/LEDBridge;->lastR:I
     if-ne v5, v10, :dirty
     sget v10, Lio/pipboy/thor/LEDBridge;->lastG:I
     if-ne v6, v10, :dirty
     sget v10, Lio/pipboy/thor/LEDBridge;->lastB:I
-    if-ne v7, v10, :dirty
-    sget v10, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
-    if-eq v9, v10, :done
+    if-eq v7, v10, :done
 
     :dirty
     sput v5, Lio/pipboy/thor/LEDBridge;->lastR:I
     sput v6, Lio/pipboy/thor/LEDBridge;->lastG:I
     sput v7, Lio/pipboy/thor/LEDBridge;->lastB:I
-    sput v9, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+    # alpha is constant — write fixed 255 below; keep lastAlpha unset.
 
     # One-shot diagnostic — first real write only.
     sget-boolean v10, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
@@ -223,7 +231,7 @@
     const-string v10, "strip-boy"
     new-instance v11, Ljava/lang/StringBuilder;
     invoke-direct {v11}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v12, "first write sat=("
+    const-string v12, "first write scaled=("
     invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v11, v5}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
     const-string v12, ","
@@ -231,7 +239,7 @@
     invoke-virtual {v11, v6}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
     invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v11, v7}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
-    const-string v12, ") alpha="
+    const-string v12, ") target_max="
     invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v11, v9}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
     const-string v12, " bottom="
@@ -242,11 +250,15 @@
     invoke-static {v10, v11}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
     :no_log
 
-    # writeStick(1, sat_r, sat_g, sat_b, alpha) — left chip
+    # alpha = 255 (ignored by the kernel driver; brightness is in RGB
+    # magnitudes after the target_max scaling above).
+    const/16 v9, 0xff
+
+    # writeStick(1, r, g, b, 255) — left chip
     const/4 v10, 0x1
     invoke-static {v10, v5, v6, v7, v9}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
 
-    # writeStick(2, sat_r, sat_g, sat_b, alpha) — right chip
+    # writeStick(2, r, g, b, 255) — right chip
     const/4 v10, 0x2
     invoke-static {v10, v5, v6, v7, v9}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
 
