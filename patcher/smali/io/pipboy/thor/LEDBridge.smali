@@ -1,180 +1,251 @@
 # LEDBridge — AYN Thor analog-stick RGB driver.
 #
-# Single static method `apply(int r, int g, int b, float fBrightness)`,
-# invoked from PipboyPostEffect.Update — every frame, with the same
-# (r,g,b) the shader's _Color uniform is using AND the per-frame
-# fBrightness multiplier the shader's _Brightness uniform uses. So the
-# stick LEDs follow the screen's colour AND its flicker/pulse/scanline
-# dimming.
+# Async architecture: PipboyPostEffect.Update calls apply(r, g, b,
+# fBrightness) on the Unity main thread; apply() just stores those
+# four into static "pending" fields and posts a Runnable to a
+# dedicated background HandlerThread. The Runnable's run() — on the
+# background thread, never the main thread — reads the pending
+# values, does the saturation + alpha math, and writes
+# /sys/class/sn3112{l,r}/led/brightness.
 #
-# Writes directly to the SN3112L/R LED controllers via
-# /sys/class/sn3112{l,r}/led/brightness — world-writable (-rw-rw-rw-)
-# on stock AYN Thor firmware. No permissions required. The wire format:
+# Why async: the LAST time we hooked Update synchronously, the per-
+# frame FileOutputStream sysfs writes (5-10 ms each × 2 sticks) ate
+# Unity's frame budget and the shader's other uniform writes
+# (_VScanAmount, _Flicker, _ScanlineFrequency, _TexelSize) drifted —
+# visible as a gradient band in the middle of the Pip-Boy screen
+# and missing scanlines. Moving sysfs to a background thread keeps
+# the main-thread work under ~200 μs per frame.
 #
-#   /sys/class/sn3112l/led/brightness  ← "1-R:G:B:A\n"
-#   /sys/class/sn3112r/led/brightness  ← "1-R:G:B:A\n"
+# Coalescing: Handler.removeCallbacks + post on every apply() so
+# the writer queue is always at most ONE entry — the latest. If
+# 5 Update frames fire before the writer drains, the writer reads
+# the LATEST pending values once and skips the intermediate.
 #
-# Note: prefix '1-' for BOTH paths. Verified empirically — only the
-# 1-prefix actually drives the LED; 2-/3-/4- are kernel-driver no-ops.
-# PATH selects side; prefix is fixed.
+# Wire format: "1-R:G:B:A\n" to both sn3112{l,r} (the kernel driver
+# accepts only prefix '1-'; '2-/3-/4-' are silent no-ops). PATH
+# selects side.
 #
-# Brightness: A = clamp(bottom_screen * fBrightness * 0.5, 0, 255).
-# At bottom=100, fBrightness=1.0 → A = 50  (≈ 20 % PWM ≈ "50 % perceived"
-# after LED gamma). Flicker (fBrightness drops to 0.3-0.7 briefly)
-# carries the screen pulse through to the LEDs.
+# Brightness:
+#   fB_clamped = min(fBrightness, 1.0)         # bursts can't brighten
+#   A = clamp(bottom_screen * fB_clamped * 0.8925, 0, 255)
+#   (0.8925 = 0.35 × 2.55  =  35 % LED-PWM-max × 255/100)
 #
-# Trailing '\n' on the payload matters — kernel driver returns EINVAL
-# without it. try/catch on Throwable so any failure is silent rather
-# than unwinding through PipboyPostEffect.Update.
+# So at bottom=100 + no flicker: A = 89 (≈35 % PWM).
+# At bottom=44 + no flicker: A = 39 (≈15 % PWM).
+# Flicker (fBrightness drops to 0.3-0.7) pulls A proportionally lower.
+# Bursts (fBrightness spikes ≥ 1.0) capped — no brightness pop.
+#
+# Saturation: subtract min channel, rescale max=255. Strips the
+# white component so the LED reads pure-hue, not washed out.
+# Dedupe on (sat_r, sat_g, sat_b, alpha) skips redundant sysfs writes.
 
 .class public Lio/pipboy/thor/LEDBridge;
 .super Ljava/lang/Object;
+.implements Ljava/lang/Runnable;
 
-# One-shot diagnostic flag — set true after the first successful
-# apply() entry; we log only that first call so launches stay
-# debuggable without spewing 30 Hz log lines under per-frame drive.
-.field private static loggedOnce:Z
 
-# Dedupe cache. Update is called every frame (30-60 Hz) by Unity,
-# but most frames repeat the same (r,g,b,alpha). Skipping the
-# two FileOutputStream+JNI writes when nothing changed cuts the
-# per-frame cost to four int compares — keeps the screen rendering
-# from stuttering while still letting flicker (which DOES change
-# alpha frame-to-frame) propagate.
+# Background-thread handler + the singleton Runnable instance.
+.field private static handler:Landroid/os/Handler;
+.field private static writer:Ljava/lang/Runnable;
+
+# Pending values posted by apply(); read by run() on background thread.
+.field private static pendingR:I
+.field private static pendingG:I
+.field private static pendingB:I
+.field private static pendingFB:F
+
+# Dedupe — last (saturated r, g, b, alpha) successfully written.
 .field private static lastR:I
 .field private static lastG:I
 .field private static lastB:I
 .field private static lastAlpha:I
 
+# One-shot diagnostic flag — log first successful write only.
+.field private static loggedOnce:Z
+
+
 .method static constructor <clinit>()V
-    .registers 1
+    .registers 5
     const/4 v0, -0x1
     sput v0, Lio/pipboy/thor/LEDBridge;->lastR:I
     sput v0, Lio/pipboy/thor/LEDBridge;->lastG:I
     sput v0, Lio/pipboy/thor/LEDBridge;->lastB:I
     sput v0, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+
+    # Spin up a dedicated HandlerThread for sysfs writes.
+    new-instance v0, Landroid/os/HandlerThread;
+    const-string v1, "strip-boy-led"
+    invoke-direct {v0, v1}, Landroid/os/HandlerThread;-><init>(Ljava/lang/String;)V
+    invoke-virtual {v0}, Landroid/os/HandlerThread;->start()V
+
+    new-instance v1, Landroid/os/Handler;
+    invoke-virtual {v0}, Landroid/os/HandlerThread;->getLooper()Landroid/os/Looper;
+    move-result-object v2
+    invoke-direct {v1, v2}, Landroid/os/Handler;-><init>(Landroid/os/Looper;)V
+    sput-object v1, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+
+    # Singleton instance — its run() is the background writer.
+    new-instance v2, Lio/pipboy/thor/LEDBridge;
+    invoke-direct {v2}, Lio/pipboy/thor/LEDBridge;-><init>()V
+    sput-object v2, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+
     return-void
 .end method
 
 
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+
+# Called from Cecil-patched PipboyPostEffect.Update on the Unity main
+# thread, every frame. Stores the pending values and posts to the
+# background writer. Coalesces queued posts so the writer always
+# operates on the latest values.
 .method public static apply(IIIF)V
-    .registers 14
+    .registers 5
     .param p0, "r"
     .param p1, "g"
     .param p2, "b"
     .param p3, "fBrightness"
 
+    sput p0, Lio/pipboy/thor/LEDBridge;->pendingR:I
+    sput p1, Lio/pipboy/thor/LEDBridge;->pendingG:I
+    sput p2, Lio/pipboy/thor/LEDBridge;->pendingB:I
+    sput p3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    return-void
+.end method
+
+
+# Background-thread writer. Saturates, computes alpha, dedupes,
+# writes both sticks. Wraps everything in try/catch so a failure
+# never propagates to the main thread (the handler thread keeps
+# running and the next apply() will get fresh work).
+.method public run()V
+    .registers 16
+
     :try_start
-    # One-shot diagnostic: first successful apply(), log (r,g,b,fB).
-    sget-boolean v6, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
-    if-nez v6, :no_log
-    const/4 v6, 0x1
-    sput-boolean v6, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
-    const-string v6, "strip-boy"
-    new-instance v7, Ljava/lang/StringBuilder;
-    invoke-direct {v7}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v8, "LEDBridge.apply live r="
-    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    invoke-virtual {v7, p0}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
-    const-string v8, " g="
-    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    invoke-virtual {v7, p1}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
-    const-string v8, " b="
-    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    invoke-virtual {v7, p2}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
-    const-string v8, " fB="
-    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    invoke-virtual {v7, p3}, Ljava/lang/StringBuilder;->append(F)Ljava/lang/StringBuilder;
-    invoke-virtual {v7}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-    move-result-object v7
-    invoke-static {v6, v7}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
-    :no_log
+    # Read pending snapshot.
+    sget v0, Lio/pipboy/thor/LEDBridge;->pendingR:I
+    sget v1, Lio/pipboy/thor/LEDBridge;->pendingG:I
+    sget v2, Lio/pipboy/thor/LEDBridge;->pendingB:I
+    sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
 
-    # Activity activity = UnityPlayer.currentActivity;  bail if null
-    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
-    if-eqz v0, :done
-
-    # ContentResolver cr = activity.getContentResolver();
-    invoke-virtual {v0}, Landroid/content/Context;->getContentResolver()Landroid/content/ContentResolver;
-    move-result-object v1
-
-    # int bottom = Settings.System.getInt(cr, "dual_screen_brightness_level", 50);
-    const-string v2, "dual_screen_brightness_level"
-    const/16 v3, 0x32
-    invoke-static {v1, v2, v3}, Landroid/provider/Settings$System;->getInt(Landroid/content/ContentResolver;Ljava/lang/String;I)I
+    # Saturation: subtract min channel, rescale max=255.
+    invoke-static {v0, v1}, Ljava/lang/Math;->min(II)I
     move-result v4
-
-    # alpha = clamp((float)bottom * fBrightness * 0.5f, 0, 255)
-    int-to-float v5, v4
-    mul-float v5, v5, p3
-    const v2, 0x3f000000              # 0.5f
-    mul-float v5, v5, v2
-    # upper clamp at 255
-    const v2, 0x437f0000              # 255.0f
-    invoke-static {v5, v2}, Ljava/lang/Math;->min(FF)F
-    move-result v5
-    # lower clamp at 0
-    const/4 v2, 0x0
-    int-to-float v2, v2
-    invoke-static {v5, v2}, Ljava/lang/Math;->max(FF)F
-    move-result v5
-    float-to-int v5, v5
-
-    # Saturation pass: strip the white component, rescale so max
-    # channel = 255. Pip-Boy's shader picks a tint that can read
-    # quite washed-out on the LEDs (e.g. (200, 230, 200) reads as
-    # near-white) — but subtracting min and renormalising gives the
-    # pure hue. Pure grey/white inputs end up as (0, 0, 0): off.
-    # That's correct — there's no hue to display.
-    #
-    # v6, v7, v8 = saturated r, g, b
-    # v9 = min channel; reused as max channel
-    invoke-static {p0, p1}, Ljava/lang/Math;->min(II)I
-    move-result v9
-    invoke-static {v9, p2}, Ljava/lang/Math;->min(II)I
-    move-result v9
-    sub-int v6, p0, v9
-    sub-int v7, p1, v9
-    sub-int v8, p2, v9
-    invoke-static {v6, v7}, Ljava/lang/Math;->max(II)I
-    move-result v9
-    invoke-static {v9, v8}, Ljava/lang/Math;->max(II)I
-    move-result v9
-    if-eqz v9, :sat_done
+    invoke-static {v4, v2}, Ljava/lang/Math;->min(II)I
+    move-result v4
+    sub-int v5, v0, v4
+    sub-int v6, v1, v4
+    sub-int v7, v2, v4
+    invoke-static {v5, v6}, Ljava/lang/Math;->max(II)I
+    move-result v4
+    invoke-static {v4, v7}, Ljava/lang/Math;->max(II)I
+    move-result v4
+    if-eqz v4, :sat_done
+    mul-int/lit16 v5, v5, 0xff
+    div-int v5, v5, v4
     mul-int/lit16 v6, v6, 0xff
-    div-int v6, v6, v9
+    div-int v6, v6, v4
     mul-int/lit16 v7, v7, 0xff
-    div-int v7, v7, v9
-    mul-int/lit16 v8, v8, 0xff
-    div-int v8, v8, v9
+    div-int v7, v7, v4
     :sat_done
 
-    # Dedupe gate: if (sat_r, sat_g, sat_b, alpha) match the last
-    # successful write, the LEDs already show this state — skip the
-    # two FileOutputStream writes. Cuts steady-state cost to four
-    # int compares; flicker still propagates because alpha changes.
-    sget v9, Lio/pipboy/thor/LEDBridge;->lastR:I
-    if-ne v6, v9, :dirty
-    sget v9, Lio/pipboy/thor/LEDBridge;->lastG:I
-    if-ne v7, v9, :dirty
-    sget v9, Lio/pipboy/thor/LEDBridge;->lastB:I
-    if-ne v8, v9, :dirty
-    sget v9, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
-    if-eq v5, v9, :done
+    # Need ContentResolver for bottom-screen brightness lookup.
+    sget-object v4, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v4, :done
+    invoke-virtual {v4}, Landroid/content/Context;->getContentResolver()Landroid/content/ContentResolver;
+    move-result-object v8
+
+    # bottom = Settings.System.getInt(cr, "dual_screen_brightness_level", 50);
+    const-string v9, "dual_screen_brightness_level"
+    const/16 v10, 0x32
+    invoke-static {v8, v9, v10}, Landroid/provider/Settings$System;->getInt(Landroid/content/ContentResolver;Ljava/lang/String;I)I
+    move-result v8
+
+    # fB_clamped = min(fBrightness, 1.0)   ← bursts can't brighten
+    const v9, 0x3f800000
+    invoke-static {v3, v9}, Ljava/lang/Math;->min(FF)F
+    move-result v3
+
+    # alpha_f = (float)bottom * fB_clamped * 0.8925
+    int-to-float v9, v8
+    mul-float v9, v9, v3
+    const v10, 0x3f644bc7              # 0.8925f = 0.35 × 2.55
+    mul-float v9, v9, v10
+
+    # clamp upper at 255.0
+    const v10, 0x437f0000
+    invoke-static {v9, v10}, Ljava/lang/Math;->min(FF)F
+    move-result v9
+    # clamp lower at 0.0
+    const/4 v10, 0x0
+    int-to-float v10, v10
+    invoke-static {v9, v10}, Ljava/lang/Math;->max(FF)F
+    move-result v9
+    float-to-int v9, v9
+
+    # Dedupe — skip the two sysfs writes if (sat_r, sat_g, sat_b, alpha)
+    # matches the last successful write. Steady-state collapses to
+    # four int compares per Update call.
+    sget v10, Lio/pipboy/thor/LEDBridge;->lastR:I
+    if-ne v5, v10, :dirty
+    sget v10, Lio/pipboy/thor/LEDBridge;->lastG:I
+    if-ne v6, v10, :dirty
+    sget v10, Lio/pipboy/thor/LEDBridge;->lastB:I
+    if-ne v7, v10, :dirty
+    sget v10, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+    if-eq v9, v10, :done
 
     :dirty
-    sput v6, Lio/pipboy/thor/LEDBridge;->lastR:I
-    sput v7, Lio/pipboy/thor/LEDBridge;->lastG:I
-    sput v8, Lio/pipboy/thor/LEDBridge;->lastB:I
-    sput v5, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
+    sput v5, Lio/pipboy/thor/LEDBridge;->lastR:I
+    sput v6, Lio/pipboy/thor/LEDBridge;->lastG:I
+    sput v7, Lio/pipboy/thor/LEDBridge;->lastB:I
+    sput v9, Lio/pipboy/thor/LEDBridge;->lastAlpha:I
 
-    # writeStick(idx=1, sat_r, sat_g, sat_b, alpha) — left chip
-    const/4 v2, 0x1
-    invoke-static {v2, v6, v7, v8, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+    # One-shot diagnostic — first real write only.
+    sget-boolean v10, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
+    if-nez v10, :no_log
+    const/4 v10, 0x1
+    sput-boolean v10, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
+    const-string v10, "strip-boy"
+    new-instance v11, Ljava/lang/StringBuilder;
+    invoke-direct {v11}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v12, "first write sat=("
+    invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v5}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v12, ","
+    invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v6}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v7}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v12, ") alpha="
+    invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v9}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v12, " bottom="
+    invoke-virtual {v11, v12}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v11, v8}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    invoke-virtual {v11}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v11
+    invoke-static {v10, v11}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    :no_log
 
-    # writeStick(idx=2, sat_r, sat_g, sat_b, alpha) — right chip
-    const/4 v2, 0x2
-    invoke-static {v2, v6, v7, v8, v5}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+    # writeStick(1, sat_r, sat_g, sat_b, alpha) — left chip
+    const/4 v10, 0x1
+    invoke-static {v10, v5, v6, v7, v9}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
+
+    # writeStick(2, sat_r, sat_g, sat_b, alpha) — right chip
+    const/4 v10, 0x2
+    invoke-static {v10, v5, v6, v7, v9}, Lio/pipboy/thor/LEDBridge;->writeStick(IIIII)V
 
     :done
     :try_end
@@ -184,7 +255,7 @@
     :catch
     move-exception v0
     const-string v1, "strip-boy"
-    const-string v2, "apply threw"
+    const-string v2, "writer threw"
     invoke-static {v1, v2, v0}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
     return-void
 .end method
@@ -197,9 +268,6 @@
     .param p2, "g"
     .param p3, "b"
     .param p4, "a"
-
-    # With .registers 11 the 5 params take v6..v10; v0..v5 are locals,
-    # so we can freely use v5 as the path string.
 
     # path = "/sys/class/sn3112" + (idx == 1 ? "l" : "r") + "/led/brightness"
     new-instance v0, Ljava/lang/StringBuilder;
@@ -220,9 +288,6 @@
     move-result-object v5
 
     # payload = "1-" + r + ":" + g + ":" + b + ":" + a + "\n"
-    # Note: leading "1-" is fixed; only 1-prefix takes effect (verified
-    # empirically that 2-/3-/4- are kernel-driver no-ops). PATH selects
-    # side; the idx arg is only used by writeStick's path picker above.
     new-instance v0, Ljava/lang/StringBuilder;
     invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
     const-string v1, "1-"
