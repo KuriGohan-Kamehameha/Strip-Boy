@@ -232,12 +232,11 @@
     const-string v2, "colorRight"
     invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
 
-    # intensity = 128 / 255 (~50%). 5% collapsed into the LED PWM
-    # quantization floor and read as on/off rather than a smooth breath;
-    # ~50% keeps the 0.5..1.0 pulse envelope in a smoothly-renderable band.
+    # intensity = 77 / 255 (~30%). 5% read as on/off (PWM quantization
+    # floor); 50% was a bit bright; 30% sits in the smooth band while dim.
     # This is the brightness tuning knob.
     const-string v2, "intensity"
-    const/16 v3, 0x80        # 128
+    const/16 v3, 0x4d        # 77
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
     const-string v2, "intensityScale"
     const/16 v3, 0xff        # 255
