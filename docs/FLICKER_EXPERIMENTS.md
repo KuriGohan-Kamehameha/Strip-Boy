@@ -7,27 +7,39 @@ analog-stick LEDs without breaking the Pip-Boy shader rendering.
 
 Three experiments are paste-and-ship ready. Try in this order:
 
-### 🚀 A2 (best path — in-process, zero alloc, full per-frame sync)
+### ☠️ A2 — DEAD END on Unity 5
 
-```bash
-# 1. Enable the patch — edit patcher/Program.cs, find the patches[] array,
-#    uncomment the FlickerSyncA2 line in the comment block after LEDStickBridge.
-# 2. Rebuild + install:
-FORCE_RESTART=1 scripts/build.sh && adb install -r apk/out/pipboy-loopback.apk
-# 3. Open Pip-Boy on the Thor. Watch the screen:
-#    - Shader OK?    → done. LEDs now sync per-frame with screen flicker.
-#    - Shader broken? → re-comment A2, try C below.
-```
+Tested 2026-06-21. Crashed in libmono.so at first Update tick.
+`UnityEngine.AndroidJNI` and `UnityEngine.jvalue` don't exist in this
+Pip-Boy's Unity 5.x build — they were added in Unity 2017+. The IL was
+well-formed but the type references couldn't be resolved at runtime,
+and Mono SIGSEGV'd trying to throw the corresponding TypeLoadException.
+
+A2's "zero-allocation" pitch is infeasible here — the only available
+JNI bridge on Unity 5 is `AndroidJavaClass.CallStatic`, which is the
+same shape (`object[]` + boxing) that broke the shader on the original
+per-frame Update attempt. See tick 9 in the Investigation status table
+for the full crash trace.
 
 ### 🔬 A1 (diagnostic — minimal IL probe, no LED behaviour change)
 
-Only worth running if A2 breaks the shader. A1 tells you whether
-the IL injection itself is the trigger (vs. specifically the JNI call):
+A1 tees the per-frame `fBrightness` into a static field via 2 IL
+instructions (`dup; stsfld`) and does nothing else — no JNI, no AJC,
+no Unity API surface that might be missing. Tells you whether IL
+injection into Update itself is the trigger:
 
 ```bash
-# Edit patches[], uncomment FlickerProbeA1 instead, rebuild, install.
-# - A1 OK    + A2 breaks → the JNI/cctor work in Update is the trigger; use C.
-# - A1 also breaks       → in-process Update IL is fundamentally incompatible.
+# Edit patcher/Program.cs, in the patches[] array uncomment the
+# FlickerProbeA1 line. Then:
+FORCE_RESTART=1 scripts/build.sh && adb install -r apk/out/pipboy-loopback.apk
+# Open Pip-Boy. Outcome:
+# - Shader OK   → IL injection is fine; the old per-frame failure was
+#                 specifically the AJC/object[]/boxing path. Next step:
+#                 a hybrid that tees in PipboyPostEffect.Update but
+#                 does the AJC.CallStatic from a SEPARATE MonoBehaviour
+#                 we add via smali. Ask me to scaffold that.
+# - Shader broken → in-process IL injection into Update is fundamentally
+#                   incompatible with the renderer. Go to C.
 ```
 
 ### 🛡️ C (sidekick APK — flicker without touching Update IL)
@@ -803,7 +815,8 @@ do in `SetColor`'s tail. Doesn't risk the shader.
 | 5 | Wrote Strip-Boy-side smali dispatcher: auto-detects flickerd via PackageManager, chooses broadcast vs sysfs. End-to-end C path is now fully spec'd. |
 | 6 | Audit pass — actually ran `flickerd/scripts/build.sh` against JDK 26 + Android SDK build-tools 36.0.0. Caught two real bugs: (1) dead `catch (SettingNotFoundException)` on the 3-arg `Settings.System.getInt` overload (Java rejects "exception never thrown in body" as an error); removed the catch. (2) deprecated `-bootclasspath` produced 3 warnings on JDK 26 — switched to `-classpath` + `-Xlint:-options`. Build now produces a valid 12,715-byte signed APK (verified manifest, classes.dex, V1 signature). Ready to `adb install`. |
 | 7 | **A1 implemented + verified.** `FlickerProbeA1` class added to `patcher/Program.cs` (un-registered in patches array by default). dotnet build clean. Patcher ran against `apk/managed/Assembly-CSharp.original.dll` with FlickerProbeA1 enabled — it correctly found Material.SetFloat("\_Brightness", ...) at IL_035C, inserted `dup; stsfld _stripboyLastFB`, and produced a valid 547,840-byte output DLL. Round-trip through the patcher re-reads cleanly and the idempotence check fires ("already installed"). Cecil logic is sound. To run A1 the user just uncomments the registration line in the patches array. |
-| 8 | **A2 implemented + verified.** `FlickerSyncA2` class added to `patcher/Program.cs` — the zero-allocation JNI variant (uses cached `IntPtr` classPtr + methodId + pre-allocated `jvalue[1]`, all per-frame work via static fields, no `object[]`, no boxing). Static cctor on PipboyPostEffect extended to allocate the jvalue array once. Compiled and ran against the pristine DLL with FlickerSyncA2 temporarily registered: applied cleanly, found the same IL_035C site, emitted the full 9-instruction dispatch. Inspected the actual injected IL via ilspycmd: every instruction in the right order, branch target resolves to the post-cache-init anchor at IL_0394, all field references valid. Round-trip clean (idempotence fires). Full Strip-Boy build pipeline (apktool decompile → Cecil patch → smali assemble → apktool rebuild → zipalign → apksigner) ran end-to-end with no errors, producing a 39.6 MB APK. Smali side: `applyBrightness(F)V` method added to `patcher/smali/io/pipboy/thor/LEDBridge.smali` (dead code unless A2 is enabled). To run A2 the user uncomments one line in the patches array — A2 subsumes A1 (detects existing A1 tee and skips its redundant dup+stsfld). |
+| 8 | **A2 implemented + verified offline.** `FlickerSyncA2` class added to `patcher/Program.cs` — the zero-allocation JNI variant (uses cached `IntPtr` classPtr + methodId + pre-allocated `jvalue[1]`, all per-frame work via static fields, no `object[]`, no boxing). Static cctor on PipboyPostEffect extended to allocate the jvalue array once. Compiled and ran against the pristine DLL: applied cleanly, found the same IL_035C site, emitted the full 9-instruction dispatch. IL inspected via ilspycmd, round-trip clean, full APK build clean. Smali side: `applyBrightness(F)V` method added to `LEDBridge.smali`. |
+| 9 | **A2 device-test FAILED.** Built with A2 registered, installed to Thor, launched app → SIGSEGV in `libmono.so` at `mono_class_vtable → mono_exception_from_name`. The app printed "first write scaled=(0,5,0) ..." from the SetColor path (LEDStickBridge OK) then died on the first per-frame Update tick. **Root cause: `UnityEngine.AndroidJNI` and `UnityEngine.jvalue` do NOT exist in this Pip-Boy's Unity 5.x build.** Cecil wrote the references against my assumption that they existed — they're a later-Unity API (2017+). At runtime Mono tried to throw a TypeLoadException, the exception construction recursed into the same broken vtable lookup, crash. Confirmed via `ilspycmd -t AndroidJNI apk/extracted/.../UnityEngine.dll` → "Could not find type definition AndroidJNI". `AndroidJavaClass` IS present (which is why LEDStickBridge works). FlickerSyncA2 reverted from patches[]; A2 source code kept in Program.cs as a record of the dead end. **Implication**: A2's "zero-allocation" pitch is infeasible on Unity 5 — the only AJC.CallStatic path is the SAME path the original per-frame Update attempt used (object[]+boxing), which already broke the shader. A2 cannot be rebuilt as a zero-alloc variant here. Remaining viable paths: **A1** (diagnostic — pure IL tee, no JNI, no AJC, would tell us if IL injection alone is the trigger) or **C** (flickerd sidekick — guaranteed safe, completely orthogonal). |
 
 Pick-order when at the keyboard: **A2 → A1 → C** (revised — A2 subsumes A1 and is just as well-verified, so skip the A1 detour unless you specifically want to test "minimal IL injection without JNI"). A1 takes 5 min and
 disambiguates the entire investigation.

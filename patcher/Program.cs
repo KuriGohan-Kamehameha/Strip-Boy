@@ -163,14 +163,17 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
-    // Experiments A1 + A2 are implemented in patcher/Program.cs as
-    // FlickerProbeA1 and FlickerSyncA2 but intentionally not registered
-    // here. To enable, uncomment the line(s) you want:
+    // A2 disabled — on-device test crashed in libmono.so
+    // (mono_class_vtable -> mono_exception_from_name) on first Update tick.
+    // Working theory: UnityEngine.AndroidJNI doesn't exist in this Unity
+    // 5.x build (only AndroidJavaClass does). Cecil wrote the reference
+    // but Mono couldn't resolve it at runtime and SIGSEGV'd trying to
+    // throw the corresponding TypeLoad exception.
+    // Re-enable AFTER changing FlickerSyncA2 to use AndroidJavaClass
+    // (with the boxing cost) instead of raw AndroidJNI.
     //
-    //   ("FlickerProbeA1",            FlickerProbeA1.Apply),   // A1 alone
-    //   ("FlickerSyncA2",             FlickerSyncA2.Apply),   // A2 (subsumes A1)
-    //
-    // See docs/FLICKER_EXPERIMENTS.md for context.
+    // FlickerProbeA1 and FlickerSyncA2 still live in this file as
+    // un-registered classes. See docs/FLICKER_EXPERIMENTS.md.
 };
 
 var anyChanged = false;
@@ -814,6 +817,8 @@ static class RewriteNoConsoleFoundDesc
         "GameNative must be running Fallout 4 on the top screen, in the foreground. " +
         "Select the 127.0.0.1 entry; any other addresses can be ignored.";
 
+    const string InterceptedKey = "$Companion_NoConsoleFoundDesc";
+
     // Prepend an early-return to FontConfigManager.GetText:
     //   if (key == "$Companion_NoConsoleFoundDesc") return <NewMessage>;
     //   ... original body ...
@@ -831,13 +836,17 @@ static class RewriteNoConsoleFoundDesc
         var body = method.Body;
         var instructions = body.Instructions;
 
-        // Idempotence: if the body already starts with `ldstr <NewMessage>` somewhere
-        // before any callvirt, we're done.
-        foreach (var ins in instructions)
+        // Idempotence: the patched prologue is `ldarg.1; ldstr "<InterceptedKey>";
+        // call op_Equality; brfalse; ldstr <NewMessage>; ret`. The InterceptedKey
+        // ldstr sits before the first call, so scan for it within the prologue.
+        // The original GetText has no reason to ldstr this specific resource key
+        // (the patch exists because the key isn't otherwise handled here).
+        for (int i = 0; i < instructions.Count; i++)
         {
-            if (ins.OpCode == OpCodes.Ldstr && (ins.Operand as string) == NewMessage)
+            var ins = instructions[i];
+            if (ins.OpCode == OpCodes.Ldstr && (ins.Operand as string) == InterceptedKey)
                 return new(false, "FontConfigManager::GetText already rewritten");
-            if (ins.OpCode == OpCodes.Callvirt || ins.OpCode == OpCodes.Call) break;
+            if (ins.OpCode == OpCodes.Callvirt) break;
         }
 
         // String.op_Equality(string, string) -> bool, static.
@@ -851,7 +860,7 @@ static class RewriteNoConsoleFoundDesc
         var il = body.GetILProcessor();
 
         var loadKey      = il.Create(OpCodes.Ldarg_1);
-        var loadCmpKey   = il.Create(OpCodes.Ldstr, "$Companion_NoConsoleFoundDesc");
+        var loadCmpKey   = il.Create(OpCodes.Ldstr, InterceptedKey);
         var callEqOp     = il.Create(OpCodes.Call, stringEquals);
         var brFalseToOrig= il.Create(OpCodes.Brfalse, firstOriginal);
         var loadNewMsg   = il.Create(OpCodes.Ldstr, NewMessage);
