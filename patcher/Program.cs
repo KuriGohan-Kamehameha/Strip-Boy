@@ -230,7 +230,8 @@ readonly record struct PatchResult(bool Changed, string Message);
 // SEED + LCG constants MUST equal PipBoyAnimation.FLICKER_SEED/LCG_MUL/LCG_ADD.
 static class FlickerSeed
 {
-    const int SEED = 0x50B0FF;
+    const int SEED = 0x50B0FF;        // flicker RNG seed (== PipBoyAnimation.FLICKER_SEED)
+    const int VSCAN_SEED = 0xC0FFEE;  // vscan RNG seed  (== PipBoyAnimation.VSCAN_SEED)
     const int LCG_MUL = 1664525;
     const int LCG_ADD = 1013904223;
 
@@ -250,11 +251,14 @@ static class FlickerSeed
         var rngField = new FieldDefinition(rngFieldName,
             FieldAttributes.Private | FieldAttributes.Static, module.TypeSystem.Int32);
         type.Fields.Add(rngField);
+        var vscanRngField = new FieldDefinition("_stripboyVScanRng",
+            FieldAttributes.Private | FieldAttributes.Static, module.TypeSystem.Int32);
+        type.Fields.Add(vscanRngField);
         var fTimeField = new FieldDefinition("_stripboyFTime",
             FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Single);
         type.Fields.Add(fTimeField);
 
-        // ---- seed in <cctor> ----
+        // ---- seed both RNGs in <cctor> ----
         var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
         if (cctor is null)
         {
@@ -270,47 +274,55 @@ static class FlickerSeed
         var cret = cctor.Body.Instructions.Last(i => i.OpCode == OpCodes.Ret);
         cil.InsertBefore(cret, cil.Create(OpCodes.Ldc_I4, SEED));
         cil.InsertBefore(cret, cil.Create(OpCodes.Stsfld, rngField));
+        cil.InsertBefore(cret, cil.Create(OpCodes.Ldc_I4, VSCAN_SEED));
+        cil.InsertBefore(cret, cil.Create(OpCodes.Stsfld, vscanRngField));
         if (cctor.Body.MaxStackSize < 1) cctor.Body.MaxStackSize = 1;
 
-        // ---- _stripboyFlickerRange(float,float) : float ----
-        var range = new MethodDefinition("_stripboyFlickerRange",
-            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
-            module.TypeSystem.Single);
-        range.Parameters.Add(new ParameterDefinition("lo", ParameterAttributes.None, module.TypeSystem.Single));
-        range.Parameters.Add(new ParameterDefinition("hi", ParameterAttributes.None, module.TypeSystem.Single));
-        range.Body = new MethodBody(range);
-        range.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Double)); // [0] frac
-        range.Body.InitLocals = true;
-        var ril = range.Body.GetILProcessor();
-        // _rng = _rng * MUL + ADD  (int32 overflow == uint overflow bit pattern)
-        ril.Append(ril.Create(OpCodes.Ldsfld, rngField));
-        ril.Append(ril.Create(OpCodes.Ldc_I4, LCG_MUL));
-        ril.Append(ril.Create(OpCodes.Mul));
-        ril.Append(ril.Create(OpCodes.Ldc_I4, LCG_ADD));
-        ril.Append(ril.Create(OpCodes.Add));
-        ril.Append(ril.Create(OpCodes.Stsfld, rngField));
-        // frac = (double)(uint)_rng / 2^32
-        ril.Append(ril.Create(OpCodes.Ldsfld, rngField));
-        ril.Append(ril.Create(OpCodes.Conv_U8));   // zero-extend int32→int64 (unsigned value)
-        ril.Append(ril.Create(OpCodes.Conv_R8));
-        ril.Append(ril.Create(OpCodes.Ldc_R8, 4294967296.0));
-        ril.Append(ril.Create(OpCodes.Div));
-        ril.Append(ril.Create(OpCodes.Stloc_0));
-        // return (float)(lo + frac*(hi-lo))
-        ril.Append(ril.Create(OpCodes.Ldarg_0));
-        ril.Append(ril.Create(OpCodes.Conv_R8));
-        ril.Append(ril.Create(OpCodes.Ldarg_1));
-        ril.Append(ril.Create(OpCodes.Conv_R8));
-        ril.Append(ril.Create(OpCodes.Ldarg_0));
-        ril.Append(ril.Create(OpCodes.Conv_R8));
-        ril.Append(ril.Create(OpCodes.Sub));
-        ril.Append(ril.Create(OpCodes.Ldloc_0));
-        ril.Append(ril.Create(OpCodes.Mul));
-        ril.Append(ril.Create(OpCodes.Add));
-        ril.Append(ril.Create(OpCodes.Conv_R4));
-        ril.Append(ril.Create(OpCodes.Ret));
-        range.Body.MaxStackSize = 4;
-        type.Methods.Add(range);
+        // ---- LCG range method builder: float Range(float lo, float hi) over
+        //      the given seeded int field. Bit-identical to PipBoyAnimation's
+        //      seededRange/vscanRange (value/2^32). ----
+        MethodDefinition BuildRange(string name, FieldDefinition rf)
+        {
+            var m = new MethodDefinition(name,
+                MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+                module.TypeSystem.Single);
+            m.Parameters.Add(new ParameterDefinition("lo", ParameterAttributes.None, module.TypeSystem.Single));
+            m.Parameters.Add(new ParameterDefinition("hi", ParameterAttributes.None, module.TypeSystem.Single));
+            m.Body = new MethodBody(m);
+            m.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Double)); // [0] frac
+            m.Body.InitLocals = true;
+            var il = m.Body.GetILProcessor();
+            il.Append(il.Create(OpCodes.Ldsfld, rf));
+            il.Append(il.Create(OpCodes.Ldc_I4, LCG_MUL));
+            il.Append(il.Create(OpCodes.Mul));
+            il.Append(il.Create(OpCodes.Ldc_I4, LCG_ADD));
+            il.Append(il.Create(OpCodes.Add));
+            il.Append(il.Create(OpCodes.Stsfld, rf));
+            il.Append(il.Create(OpCodes.Ldsfld, rf));
+            il.Append(il.Create(OpCodes.Conv_U8));
+            il.Append(il.Create(OpCodes.Conv_R8));
+            il.Append(il.Create(OpCodes.Ldc_R8, 4294967296.0));
+            il.Append(il.Create(OpCodes.Div));
+            il.Append(il.Create(OpCodes.Stloc_0));
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Conv_R8));
+            il.Append(il.Create(OpCodes.Ldarg_1));
+            il.Append(il.Create(OpCodes.Conv_R8));
+            il.Append(il.Create(OpCodes.Ldarg_0));
+            il.Append(il.Create(OpCodes.Conv_R8));
+            il.Append(il.Create(OpCodes.Sub));
+            il.Append(il.Create(OpCodes.Ldloc_0));
+            il.Append(il.Create(OpCodes.Mul));
+            il.Append(il.Create(OpCodes.Add));
+            il.Append(il.Create(OpCodes.Conv_R4));
+            il.Append(il.Create(OpCodes.Ret));
+            m.Body.MaxStackSize = 4;
+            type.Methods.Add(m);
+            return m;
+        }
+
+        var range = BuildRange("_stripboyFlickerRange", rngField);
+        var vrange = BuildRange("_stripboyVScanRange", vscanRngField);
 
         // ---- tee fTime: after `stfld fTime` near the top of Update ----
         var instrs = update.Body.Instructions;
@@ -341,26 +353,44 @@ static class FlickerSeed
         if (toggleIdx < 0 || perlinIdx < 0)
             throw new Exception("flicker window (bFlickering..PerlinNoise) not found");
 
+        static bool IsRandomRangeFF(Instruction ins) =>
+            (ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+            && ins.Operand is MethodReference mr
+            && mr.Name == "Range" && mr.DeclaringType.Name == "Random"
+            && mr.Parameters.Count == 2
+            && mr.Parameters[0].ParameterType.MetadataType == MetadataType.Single;
+
+        // Flicker draws: the Random.Range calls between the bFlickering toggle
+        // and the first PerlinNoise → seeded flicker RNG.
         int redirected = 0;
         for (int i = toggleIdx; i < perlinIdx; i++)
         {
-            var ins = instrs[i];
-            if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
-                && ins.Operand is MethodReference mr
-                && mr.Name == "Range" && mr.DeclaringType.Name == "Random"
-                && mr.Parameters.Count == 2
-                && mr.Parameters[0].ParameterType.MetadataType == MetadataType.Single)
+            if (IsRandomRangeFF(instrs[i]))
             {
-                ins.OpCode = OpCodes.Call;
-                ins.Operand = range;
+                instrs[i].OpCode = OpCodes.Call;
+                instrs[i].Operand = range;
                 redirected++;
             }
         }
         if (redirected == 0) throw new Exception("no flicker Random.Range calls redirected");
 
+        // VScan draw: the Random.Range BEFORE the flicker block (fVScanDelay =
+        // Random.Range(min,max)) → seeded vscan RNG. Independent sequence so it
+        // never perturbs the flicker draws.
+        int vredirected = 0;
+        for (int i = 0; i < toggleIdx; i++)
+        {
+            if (IsRandomRangeFF(instrs[i]))
+            {
+                instrs[i].OpCode = OpCodes.Call;
+                instrs[i].Operand = vrange;
+                vredirected++;
+            }
+        }
+
         return new(true,
-            $"PipboyPostEffect flicker seeded (SEED=0x{SEED:X}); redirected {redirected} "
-          + $"Random.Range call(s) + tee'd fTime → _stripboyFTime");
+            $"PipboyPostEffect seeded: {redirected} flicker + {vredirected} vscan "
+          + $"Random.Range call(s) redirected; tee'd fTime → _stripboyFTime");
     }
 }
 
