@@ -50,8 +50,8 @@
     invoke-static {v1, v2, v3}, Landroid/provider/Settings$System;->getInt(Landroid/content/ContentResolver;Ljava/lang/String;I)I
     move-result v4
 
-    # alpha = min(bottom, 70) * 255 / 100
-    const/16 v2, 0x46
+    # alpha = min(bottom, 50) * 255 / 100  (50 % ceiling)
+    const/16 v2, 0x32
     invoke-static {v4, v2}, Ljava/lang/Math;->min(II)I
     move-result v5
     mul-int/lit16 v5, v5, 0xff
