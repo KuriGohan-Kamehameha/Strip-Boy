@@ -266,8 +266,35 @@ static class MenuPulse
             hooked++;
         }
 
-        if (hooked == 0) return new(false, "MenuPulse already installed (or nav methods absent)");
-        return new(true, $"PipboyMenuMovie nav → LEDBridge.menuPulse() injected into {hooked} method(s)");
+        // Also hook PipboyPostEffect.TriggerVHold → LEDBridge.staticBurst().
+        // TriggerVHold is the dramatic vertical-hold "channel swap" roll
+        // (fired 5% of page switches, always on world/local-map switch, and on
+        // menu open) — mirror it on the sticks with a TV-static scramble.
+        var ppe = module.GetType("PipboyPostEffect");
+        var vhold = ppe?.Methods.FirstOrDefault(x => x.Name == "TriggerVHold" && x.Parameters.Count == 0);
+        if (vhold?.Body != null
+            && !vhold.Body.Instructions.Any(i =>
+                   i.OpCode == OpCodes.Ldstr && (i.Operand as string) == "staticBurst"))
+        {
+            var il = vhold.Body.GetILProcessor();
+            var first = vhold.Body.Instructions[0];
+            var seq = new[]
+            {
+                il.Create(OpCodes.Ldstr, BridgeClassFqn),
+                il.Create(OpCodes.Newobj, ajcCtor),
+                il.Create(OpCodes.Ldstr, "staticBurst"),
+                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+                il.Create(OpCodes.Callvirt, callStatic),
+            };
+            foreach (var ins in seq) il.InsertBefore(first, ins);
+            if (vhold.Body.MaxStackSize < 4) vhold.Body.MaxStackSize = 4;
+            hooked++;
+        }
+
+        if (hooked == 0) return new(false, "MenuPulse already installed (or hook targets absent)");
+        return new(true, $"LED reactions injected into {hooked} site(s) "
+          + "(PipboyMenuMovie nav → menuPulse, PipboyPostEffect.TriggerVHold → staticBurst)");
     }
 }
 
