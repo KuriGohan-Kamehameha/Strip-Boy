@@ -3,6 +3,73 @@
 How to mirror the screen's per-frame `fBrightness` flicker onto the
 analog-stick LEDs without breaking the Pip-Boy shader rendering.
 
+## Wake-up checklist
+
+Three experiments are paste-and-ship ready. Try in this order:
+
+### 🚀 A2 (best path — in-process, zero alloc, full per-frame sync)
+
+```bash
+# 1. Enable the patch — edit patcher/Program.cs, find the patches[] array,
+#    uncomment the FlickerSyncA2 line in the comment block after LEDStickBridge.
+# 2. Rebuild + install:
+FORCE_RESTART=1 scripts/build.sh && adb install -r apk/out/pipboy-loopback.apk
+# 3. Open Pip-Boy on the Thor. Watch the screen:
+#    - Shader OK?    → done. LEDs now sync per-frame with screen flicker.
+#    - Shader broken? → re-comment A2, try C below.
+```
+
+### 🔬 A1 (diagnostic — minimal IL probe, no LED behaviour change)
+
+Only worth running if A2 breaks the shader. A1 tells you whether
+the IL injection itself is the trigger (vs. specifically the JNI call):
+
+```bash
+# Edit patches[], uncomment FlickerProbeA1 instead, rebuild, install.
+# - A1 OK    + A2 breaks → the JNI/cctor work in Update is the trigger; use C.
+# - A1 also breaks       → in-process Update IL is fundamentally incompatible.
+```
+
+### 🛡️ C (sidekick APK — flicker without touching Update IL)
+
+The guaranteed-safe fallback. flickerd lives in its own process so
+nothing it does can disturb Pip-Boy's renderer.
+
+```bash
+# 1. Build + install flickerd (already verified — 12.7 KB signed APK):
+cd flickerd && ./scripts/build.sh && adb install -r out/flickerd.apk && cd ..
+
+# 2. Wire Strip-Boy's LEDBridge.smali to broadcast intents instead of
+#    direct sysfs (paste the smali dispatcher block from the
+#    "Wiring Strip-Boy to flickerd" section below into
+#    patcher/smali/io/pipboy/thor/LEDBridge.smali).
+
+# 3. Rebuild + install Strip-Boy:
+FORCE_RESTART=1 scripts/build.sh && adb install -r apk/out/pipboy-loopback.apk
+
+# 4. Open Pip-Boy. LEDs flicker via separate process; shader untouched.
+#    `adb logcat -s strip-boy` should print "dispatch = broadcast (flickerd detected)"
+#    on the first colour change.
+```
+
+**If A2 works → ship A2.** If only C works → ship C (flickerd is
+harmless coexistence-wise; you can also uninstall flickerd later to
+fall back to event-driven LEDs).
+
+### Risk notes (in case all three feel suspect)
+
+- A2 adds 4 static fields to `PipboyPostEffect` AND extends its `<cctor>`
+  (or creates one if absent). If you suspect the cctor change is the
+  trigger, an "Experiment D" variant could move all the static state
+  to a separate type so `PipboyPostEffect` itself is barely touched —
+  not implemented yet; tell me if A2 fails and you want me to write it.
+- All three experiments leave `LEDStickBridge` (the SetColor hook)
+  in place, so colour changes still drive LEDs at minimum, even if
+  flicker sync fails.
+- The flickerd sidekick has its own `auto-stop after 30s of silence`
+  guard, so leaving it installed is harmless when Strip-Boy isn't
+  broadcasting.
+
 ## Problem recap
 
 The shipped LED bridge writes once per `PipboyPostEffect.SetColor` call
