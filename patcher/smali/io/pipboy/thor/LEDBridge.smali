@@ -54,6 +54,13 @@
 .field private static pendingB:I
 .field private static pendingFB:F
 
+# Wall-clock (elapsedRealtime ms) captured when pendingFB was last set by
+# apply() (i.e. at the last SetColor). The heartbeat extrapolates a FRESH
+# fTime estimate = pendingFB + (now - pendingFBWall)/1000 so Bifrost re-anchors
+# the PIPBOY flicker/vscan to a current clock, not the value frozen at the last
+# colour change. Assumes game-time ≈ wall-clock since that change.
+.field private static pendingFBWall:J
+
 # Dedupe — last (saturated r, g, b, alpha) successfully written.
 .field private static lastR:I
 .field private static lastG:I
@@ -139,6 +146,11 @@
     sput p2, Lio/pipboy/thor/LEDBridge;->pendingB:I
     sput p3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
 
+    # Stamp the wall-clock for fTime extrapolation in the heartbeat.
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+    move-result-wide v0
+    sput-wide v0, Lio/pipboy/thor/LEDBridge;->pendingFBWall:J
+
     # Lazy-detect whether Bifrost is installed; cache the verdict.
     sget v4, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
     if-nez v4, :have_mode
@@ -160,7 +172,7 @@
     sput-boolean v4, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
     sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
     sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
-    const-wide/16 v2, 0x7d0      # 2000ms heartbeat interval
+    const-wide/16 v2, 0x1f4      # 500ms heartbeat interval (tighter re-anchor)
     invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
 
     :hb_running
@@ -286,11 +298,20 @@
     const-string v3, "EXPLICIT_CLEAR"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
-    # phaseSeconds = pendingFB (the screen's fTime, passed as apply()'s 4th arg
-    # by the FlickerSeed-aware LEDStickBridge). Bifrost's PIPBOY effect uses it
-    # to fast-forward its seeded flicker sim to the screen's exact state.
+    # phaseSeconds = pendingFB + (elapsedRealtime - pendingFBWall)/1000 — a FRESH
+    # fTime estimate. The heartbeat would otherwise resend the fTime frozen at
+    # the last SetColor; extrapolating by elapsed wall-clock keeps Bifrost's
+    # PIPBOY re-anchor current (assumes game-time ≈ wall-clock since that change).
+    invoke-static {}, Landroid/os/SystemClock;->elapsedRealtime()J
+    move-result-wide v3
+    sget-wide v5, Lio/pipboy/thor/LEDBridge;->pendingFBWall:J
+    sub-long v3, v3, v5
+    long-to-float v3, v3
+    const v4, 0x447a0000          # 1000.0f
+    div-float v3, v3, v4
+    sget v4, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+    add-float v3, v3, v4
     const-string v2, "phaseSeconds"
-    sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
 
     # activity.sendBroadcast(intent)
@@ -357,7 +378,7 @@
 
     sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
     sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
-    const-wide/16 v2, 0x7d0      # 2000ms
+    const-wide/16 v2, 0x1f4      # 500ms (tighter re-anchor for PIPBOY sync)
     invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
     return-void
 
