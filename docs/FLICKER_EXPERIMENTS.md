@@ -360,6 +360,12 @@ call on a frame counter, fire only every Nth frame.
 
 ### Experiment C — Sidekick APK (the user's "Bifrost plugin" framing)
 
+**Materialized at `flickerd/` in this repo.** Sources, manifest, and a
+Gradle-less build script (`flickerd/scripts/build.sh`) are checked in.
+~520 LOC across 5 files; produces an ~10 KB APK. See `flickerd/README.md`
+for build / install / wire-up instructions. The sketch below remains
+for reference but the actual code is what you'll ship from.
+
 A standalone tiny APK, `io.pipboy.thor.flickerd`, lives alongside
 Strip-Boy. Owns all LED writes. Receives colour via broadcast
 intent. Generates Perlin-ish flicker on its own timer.

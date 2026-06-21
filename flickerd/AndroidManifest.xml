@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Strip-Boy Flickerd — the LED sidekick.
+
+  Tiny standalone APK that owns all writes to /sys/class/sn3112{l,r}/led/brightness.
+  Receives colour-update broadcasts from the patched Pip-Boy companion app and
+  applies a Perlin-ish flicker pattern at 30 Hz on a HandlerThread. Lives
+  entirely outside Unity's rendering path, so it can't disturb the Pip-Boy
+  shader the way an in-process per-frame hook can.
+
+  No permissions required — /sys/class/sn3112{l,r}/led/brightness is world-
+  writable on stock AYN Thor firmware, same path Moonbench's Bifrost uses.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.pipboy.thor.flickerd"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="33"/>
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+
+    <application
+        android:label="Strip-Boy Flickerd"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false">
+
+        <service
+            android:name=".TickerService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="LED tick loop for Strip-Boy companion"/>
+        </service>
+
+        <receiver
+            android:name=".ColorReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.pipboy.thor.SET_COLOR"/>
+                <action android:name="io.pipboy.thor.STOP"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
