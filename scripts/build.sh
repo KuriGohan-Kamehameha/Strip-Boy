@@ -218,7 +218,17 @@ cp "$DLL_PATCHED" "$ORIGINAL_DLL_PATH"
 # ---------------------------------------------------------------------------
 log "4/6  apktool b  (rebuild)"
 rm -f "$APK_FROM_APKTOOL"
-apktool b "$EXTRACTED_DIR" -o "$APK_FROM_APKTOOL" 2>&1 | tail -3 | sed 's/^/     /'
+# Run apktool b; let it write to stderr/stdout directly, and only
+# proceed if it exits cleanly. The old pipe `| tail -3 | sed` swallowed
+# apktool's non-zero exit code via the trailing pipe stage, which is
+# how an upstream smali typo could let the build "succeed" but produce
+# a stale APK with the previous classes.dex.
+apktool b "$EXTRACTED_DIR" -o "$APK_FROM_APKTOOL" 2>&1 | sed 's/^/     /'
+apktool_rc=${PIPESTATUS[0]}
+if [ "$apktool_rc" != "0" ]; then
+    die "apktool b failed (exit $apktool_rc) — likely a smali assemble error above"
+fi
+[ -s "$APK_FROM_APKTOOL" ] || die "apktool b produced no output at $APK_FROM_APKTOOL"
 
 # ---------------------------------------------------------------------------
 # 5. zipalign.

@@ -2,25 +2,20 @@
 """
 patch_manifest.py — apply manifest changes for Strip-Boy.
 
-Idempotent. Two manifest changes, run independently:
+Idempotent. Single manifest change:
 
-  1. Add io.pipboy.thor.LauncherActivity as the MAIN/LAUNCHER activity,
-     strip the launcher intent-filter from UnityPlayerNativeActivity,
-     so taps on the launcher icon route through our display-redirecting
-     LauncherActivity first.
+  Add io.pipboy.thor.LauncherActivity as the MAIN/LAUNCHER activity,
+  strip the launcher intent-filter from UnityPlayerNativeActivity, so
+  taps on the launcher icon route through our display-redirecting
+  LauncherActivity first.
 
-  2. Add the WRITE_SETTINGS uses-permission so io.pipboy.thor.LEDBridge
-     can write Settings.System keys that drive the AYN Thor's analog-
-     stick RGB LEDs. WRITE_SETTINGS is a special-access permission;
-     after install, grant it with one of:
-
-         adb shell appops set com.bethsoft.falloutcompanionapp \\
-             WRITE_SETTINGS allow
-
-         (or)  Settings → Apps → Special access → Modify system
-               settings → Fallout 4 Pip-Boy → Allow
-
-     If never granted, the LEDBridge no-ops silently (canWrite gate).
+(Earlier revisions also injected WRITE_SETTINGS / WRITE_SECURE_SETTINGS
+to let LEDBridge write Settings.System.joystick_led_light_picker_color.
+That approach was abandoned: AYN's vendor SettingsProvider rejects
+those writes from non-privileged UIDs even with both perms granted.
+LEDBridge now writes directly to /sys/class/sn3112{l,r}/led/brightness
+— world-writable on stock AYN Thor firmware, the same path Moonbench
+Bifrost uses — so no permissions are needed.)
 
 Run with the path to the decoded AndroidManifest.xml as the argument:
 
@@ -36,20 +31,6 @@ ET.register_namespace("android", ANDROID_NS)
 NAME_ATTR = f"{{{ANDROID_NS}}}name"
 LAUNCHER_FQN = "io.pipboy.thor.LauncherActivity"
 UNITY_FQN = "com.unity3d.player.UnityPlayerNativeActivity"
-WRITE_SETTINGS_PERM = "android.permission.WRITE_SETTINGS"
-
-
-def ensure_write_settings_permission(root) -> bool:
-    """Inject <uses-permission android:name="WRITE_SETTINGS"/> as the
-    first child of <manifest> if not already present. Returns True if
-    the element was added, False if it was already there."""
-    for perm in root.findall("uses-permission"):
-        if perm.get(NAME_ATTR) == WRITE_SETTINGS_PERM:
-            return False
-    perm = ET.Element("uses-permission")
-    perm.set(NAME_ATTR, WRITE_SETTINGS_PERM)
-    root.insert(0, perm)
-    return True
 
 
 def main(path: str) -> int:
@@ -60,17 +41,10 @@ def main(path: str) -> int:
         print("ERROR: no <application> element", file=sys.stderr)
         return 2
 
-    # Change 2 is independent of change 1 — run it first, unconditionally.
-    added_perm = ensure_write_settings_permission(root)
-
-    # Detect already-patched state for change 1.
+    # Detect already-patched state.
     for activity in app.findall("activity"):
         if activity.get(NAME_ATTR) == LAUNCHER_FQN:
-            note = (f"; added {WRITE_SETTINGS_PERM}" if added_perm
-                    else "")
-            print(f"skip: {LAUNCHER_FQN} already present in manifest{note}")
-            if added_perm:
-                tree.write(path, xml_declaration=True, encoding="utf-8")
+            print(f"skip: {LAUNCHER_FQN} already present in manifest")
             return 0
 
     # 1. Strip launcher intent-filter from UnityPlayerNativeActivity.
@@ -117,9 +91,8 @@ def main(path: str) -> int:
     cat2.set(NAME_ATTR, "android.intent.category.LEANBACK_LAUNCHER")
 
     tree.write(path, xml_declaration=True, encoding="utf-8")
-    perm_note = (f"; added {WRITE_SETTINGS_PERM}" if added_perm else "")
     print(f"patched: stripped {removed} launcher intent-filter(s) from {UNITY_FQN}, "
-          f"added {LAUNCHER_FQN}{perm_note}")
+          f"added {LAUNCHER_FQN}")
     return 0
 
 
