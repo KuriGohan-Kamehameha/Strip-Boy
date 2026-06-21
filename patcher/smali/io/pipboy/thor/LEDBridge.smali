@@ -30,6 +30,11 @@
 .class public Lio/pipboy/thor/LEDBridge;
 .super Ljava/lang/Object;
 
+# One-shot diagnostic flag — set true after the first successful
+# apply() entry; we log only that first call so launches stay
+# debuggable without spewing 30 Hz log lines under F4 protocol drive.
+.field private static loggedOnce:Z
+
 
 .method public static apply(III)V
     .registers 13
@@ -38,6 +43,30 @@
     .param p2, "b"
 
     :try_start
+    # One-shot diagnostic: log the very first apply() call with its
+    # (r, g, b) so launches stay debuggable. Subsequent calls take
+    # the brtrue branch and emit nothing.
+    sget-boolean v6, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
+    if-nez v6, :no_log
+    const/4 v6, 0x1
+    sput-boolean v6, Lio/pipboy/thor/LEDBridge;->loggedOnce:Z
+    const-string v6, "strip-boy"
+    new-instance v7, Ljava/lang/StringBuilder;
+    invoke-direct {v7}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v8, "LEDBridge.apply live r="
+    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v7, p0}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v8, " g="
+    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v7, p1}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v8, " b="
+    invoke-virtual {v7, v8}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v7, p2}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    invoke-virtual {v7}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v7
+    invoke-static {v6, v7}, Landroid/util/Log;->i(Ljava/lang/String;Ljava/lang/String;)I
+    :no_log
+
     sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
     if-eqz v0, :done
 
@@ -71,6 +100,10 @@
     return-void
 
     :catch
+    move-exception v0
+    const-string v1, "strip-boy"
+    const-string v2, "apply threw"
+    invoke-static {v1, v2, v0}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
     return-void
 .end method
 
