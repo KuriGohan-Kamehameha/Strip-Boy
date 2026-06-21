@@ -39,7 +39,7 @@ echo "[regr] assertions"
 if echo "$OUT" | grep -q '^\[FAIL'; then note "FAIL: a patch errored"; fail=1; fi
 
 # 2. Each expected patch reported [patch] (applied to the pristine DLL).
-for p in LoopbackDiscovery LEDStickBridge FlickerSeed MenuPulse; do
+for p in LoopbackDiscovery LEDStickBridge FlickerSeed MenuPulse PipboyDeactivateClear; do
     if echo "$OUT" | grep -q "\[patch\] $p"; then note "ok: $p applied"
     else note "FAIL: $p did not apply (target renamed or idempotence misfire?)"; fail=1; fi
 done
@@ -50,7 +50,8 @@ IL_TXT="/tmp/regr-il.txt"
 : > "$IL_TXT"
 "$ILSPY" -il /tmp/regr-patched.dll -t PipboyPostEffect >> "$IL_TXT" 2>/dev/null || true
 "$ILSPY" -il /tmp/regr-patched.dll -t PipboyMenuMovie >> "$IL_TXT" 2>/dev/null || true
-for sym in _stripboyFlickerRange menuPulse staticBurst _stripboyLedBridgeCls _stripboyVisibleInstanceId onFlickerToggle onBurst; do
+"$ILSPY" -il /tmp/regr-patched.dll -t FlowManager >> "$IL_TXT" 2>/dev/null || true
+for sym in _stripboyFlickerRange menuPulse staticBurst _stripboyLedBridgeCls _stripboyVisibleInstanceId onFlickerToggle onBurst onDeactivate; do
     if grep -q "$sym" "$IL_TXT"; then note "ok: injected '$sym' present"
     else note "FAIL: injected symbol '$sym' missing from patched DLL"; fail=1; fi
 done
@@ -62,6 +63,12 @@ for m in 'sendPulse(Ljava/lang/String;)V' 'menuPulse()V' 'staticBurst()V' 'apply
     if grep -q "$m" "$SMALI"; then note "ok: smali $m present"
     else note "FAIL: smali method '$m' missing from LEDBridge.smali"; fail=1; fi
 done
+
+# 5. The separate LEDClear bridge class defines the deactivation broadcast the
+#    FlowManager hook calls.
+CLEAR_SMALI="patcher/smali/io/pipboy/thor/LEDClear.smali"
+if grep -q 'onDeactivate()V' "$CLEAR_SMALI" 2>/dev/null; then note "ok: smali onDeactivate()V present (LEDClear)"
+else note "FAIL: smali method 'onDeactivate()V' missing from LEDClear.smali"; fail=1; fi
 
 rm -f /tmp/regr-patched.dll
 if [ "$fail" = 0 ]; then echo "[regr] PASS — all patcher behaviour guarded"; else

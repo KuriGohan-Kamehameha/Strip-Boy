@@ -166,6 +166,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("FlickerSeed",               FlickerSeed.Apply),
     ("BurstFeed",                 BurstFeed.Apply),
     ("MenuPulse",                 MenuPulse.Apply),
+    ("PipboyDeactivateClear",     PipboyDeactivateClear.Apply),
     // B disabled — on-device test 2026-06-21 affected the shader
     // (gradient banding less severe than the original Update-hook
     // failure, but still visible). Per-frame AJC.CallStatic has
@@ -296,6 +297,61 @@ static class MenuPulse
         if (hooked == 0) return new(false, "MenuPulse already installed (or hook targets absent)");
         return new(true, $"LED reactions injected into {hooked} site(s) "
           + "(PipboyMenuMovie nav → menuPulse, PipboyPostEffect.TriggerVHold → staticBurst)");
+    }
+}
+
+// PipboyDeactivateClear — tell Bifrost the instant the Pip-Boy stops being on
+// screen. FlowManager.OnApplicationPause(true) fires when the companion app
+// backgrounds; we inject a call to io.pipboy.thor.LEDClear.onDeactivate(),
+// which broadcasts ACTION_CLEAR so Bifrost reverts the stick LEDs immediately
+// instead of waiting out the ACTION_DISPLAY lease. Event-driven (once per
+// background), so it's nowhere near the per-frame renderer-poison path.
+static class PipboyDeactivateClear
+{
+    const string ClearClassFqn = "io.pipboy.thor.LEDClear";
+
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("FlowManager");
+        if (type is null) return new(false, "FlowManager type not found");
+        var m = type.Methods.FirstOrDefault(x =>
+            x.Name == "OnApplicationPause" && x.Parameters.Count == 1);
+        if (m?.Body is null) return new(false, "FlowManager.OnApplicationPause(bool) not found");
+
+        // Idempotence: skip if our onDeactivate ldstr is already present.
+        if (m.Body.Instructions.Any(i =>
+                i.OpCode == OpCodes.Ldstr && (i.Operand as string) == "onDeactivate"))
+            return new(false, "PipboyDeactivateClear already installed");
+
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass",
+            module, unityRef, valueType: false);
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType) { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType) { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        var il = m.Body.GetILProcessor();
+        var first = m.Body.Instructions[0];
+        // if (!isPaused) goto <original body>;
+        // new AndroidJavaClass("io.pipboy.thor.LEDClear").CallStatic("onDeactivate", new object[0]);
+        var seq = new[]
+        {
+            il.Create(OpCodes.Ldarg_1),            // isPaused (arg0 = this)
+            il.Create(OpCodes.Brfalse, first),
+            il.Create(OpCodes.Ldstr, ClearClassFqn),
+            il.Create(OpCodes.Newobj, ajcCtor),
+            il.Create(OpCodes.Ldstr, "onDeactivate"),
+            il.Create(OpCodes.Ldc_I4_0),
+            il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+            il.Create(OpCodes.Callvirt, callStatic),
+        };
+        foreach (var ins in seq) il.InsertBefore(first, ins);
+        if (m.Body.MaxStackSize < 4) m.Body.MaxStackSize = 4;
+
+        return new(true, "ACTION_CLEAR on background injected into FlowManager.OnApplicationPause");
     }
 }
 
