@@ -164,6 +164,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
     ("FlickerSeed",               FlickerSeed.Apply),
+    ("MenuPulse",                 MenuPulse.Apply),
     // B disabled — on-device test 2026-06-21 affected the shader
     // (gradient banding less severe than the original Update-hook
     // failure, but still visible). Per-frame AJC.CallStatic has
@@ -211,6 +212,64 @@ return 0;
 /* ===================================================================== */
 
 readonly record struct PatchResult(bool Changed, string Message);
+
+// MenuPulse — flash the analog-stick LEDs brighter for a beat whenever the
+// user navigates between Pip-Boy pages/tabs. Injects a no-arg
+// LEDBridge.menuPulse() call at the top of PipboyMenuMovie::onNewPage and
+// ::onNewTab (the page/tab navigation entry points, each of which already
+// plays a rotary nav sound). menuPulse() (Java side) sends a brief brighter
+// PIPBOY command to Bifrost then returns to the resting level.
+static class MenuPulse
+{
+    const string BridgeClassFqn = "io.pipboy.thor.LEDBridge";
+
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyMenuMovie")
+            ?? throw new Exception("PipboyMenuMovie type not found");
+
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var ajcType = new TypeReference("UnityEngine", "AndroidJavaClass",
+            module, unityRef, valueType: false);
+        var ajcCtor = new MethodReference(".ctor", module.TypeSystem.Void, ajcType) { HasThis = true };
+        ajcCtor.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        var callStatic = new MethodReference("CallStatic", module.TypeSystem.Void, ajcType) { HasThis = true };
+        callStatic.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        callStatic.Parameters.Add(new ParameterDefinition(new ArrayType(module.TypeSystem.Object)));
+
+        int hooked = 0;
+        foreach (var methodName in new[] { "onNewPage", "onNewTab" })
+        {
+            var m = type.Methods.FirstOrDefault(x => x.Name == methodName && x.Parameters.Count == 1);
+            if (m is null || m.Body is null) continue;
+
+            // Idempotence: skip if our menuPulse ldstr is already present.
+            if (m.Body.Instructions.Any(i =>
+                    i.OpCode == OpCodes.Ldstr && (i.Operand as string) == "menuPulse"))
+                continue;
+
+            var il = m.Body.GetILProcessor();
+            var first = m.Body.Instructions[0];
+            // new AndroidJavaClass("io.pipboy.thor.LEDBridge").CallStatic("menuPulse", new object[0]);
+            var seq = new[]
+            {
+                il.Create(OpCodes.Ldstr, BridgeClassFqn),
+                il.Create(OpCodes.Newobj, ajcCtor),
+                il.Create(OpCodes.Ldstr, "menuPulse"),
+                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Newarr, module.TypeSystem.Object),
+                il.Create(OpCodes.Callvirt, callStatic),
+            };
+            foreach (var ins in seq) il.InsertBefore(first, ins);
+            if (m.Body.MaxStackSize < 4) m.Body.MaxStackSize = 4;
+            hooked++;
+        }
+
+        if (hooked == 0) return new(false, "MenuPulse already installed (or nav methods absent)");
+        return new(true, $"PipboyMenuMovie nav → LEDBridge.menuPulse() injected into {hooked} method(s)");
+    }
+}
 
 // FlickerSeed — make the screen's flicker deterministic + seed-matched with
 // the Bifrost PIPBOY plugin, so the stick LEDs reproduce the screen's exact

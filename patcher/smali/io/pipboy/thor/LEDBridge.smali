@@ -549,3 +549,97 @@
 
     return-void
 .end method
+
+
+# ---------------------------------------------------------------------------
+# Menu-navigation pulse (MenuPulse Cecil patch hooks PipboyMenuMovie
+# onNewPage/onNewTab → this). Brief brightness pop on each page/tab switch.
+# ---------------------------------------------------------------------------
+
+# Send a PIPBOY ACTION_DISPLAY at a given intensity (green, phaseSeconds
+# carried from pendingFB so the brightness change doesn't desync the
+# screen-matched flicker). Package-private so PulseReset can call it.
+.method static pipboyAt(I)V
+    .registers 8
+    .param p0, "intensity"
+
+    :try_start
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    if-eqz v0, :done
+
+    new-instance v1, Landroid/content/Intent;
+    const-string v2, "com.moonbench.bifrost.api.ACTION_DISPLAY"
+    invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)V
+
+    new-instance v2, Landroid/content/ComponentName;
+    const-string v3, "com.moonbench.bifrost"
+    const-string v4, "com.moonbench.bifrost.external.ExternalApiReceiver"
+    invoke-direct {v2, v3, v4}, Landroid/content/ComponentName;-><init>(Ljava/lang/String;Ljava/lang/String;)V
+    invoke-virtual {v1, v2}, Landroid/content/Intent;->setComponent(Landroid/content/ComponentName;)Landroid/content/Intent;
+
+    const-string v2, "apiVersion"
+    const/4 v3, 0x1
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    const-string v2, "effect"
+    const-string v3, "PIPBOY"
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+
+    # color = 0xFF00FF00 (Pip-Boy green)
+    const/high16 v5, -0x1000000
+    const/16 v6, 0xff
+    shl-int/lit8 v6, v6, 0x8
+    or-int v5, v5, v6
+    const-string v2, "color"
+    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "colorRight"
+    invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    const-string v2, "intensity"
+    invoke-virtual {v1, v2, p0}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+    const-string v2, "intensityScale"
+    const/16 v3, 0xff
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
+
+    const-string v2, "until"
+    const-string v3, "EXPLICIT_CLEAR"
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
+
+    const-string v2, "phaseSeconds"
+    sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
+
+    invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
+
+    :done
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :catch
+
+    return-void
+
+    :catch
+    move-exception v0
+    return-void
+.end method
+
+
+# Called from PipboyMenuMovie nav (via AndroidJavaClass). Pops bright now,
+# schedules a return to the resting level ~180ms later on the LED handler.
+.method public static menuPulse()V
+    .registers 5
+
+    # bright pop (~200/255)
+    const/16 v0, 0xc8
+    invoke-static {v0}, Lio/pipboy/thor/LEDBridge;->pipboyAt(I)V
+
+    # schedule return to resting level (~77/255) after 180ms
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    if-eqz v0, :no_handler
+    new-instance v1, Lio/pipboy/thor/PulseReset;
+    invoke-direct {v1}, Lio/pipboy/thor/PulseReset;-><init>()V
+    const-wide/16 v2, 0xb4
+    invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
+
+    :no_handler
+    return-void
+.end method
