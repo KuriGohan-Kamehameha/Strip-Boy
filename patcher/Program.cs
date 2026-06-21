@@ -1112,16 +1112,12 @@ static class LEDStickBridge
         var setter = type.Methods.FirstOrDefault(m =>
             m.Name == "set_PipboyEffectColor" && m.Parameters.Count == 1)
             ?? throw new Exception("AppSettings::set_PipboyEffectColor(Color) not found");
-        var getter = type.Methods.FirstOrDefault(m =>
-            m.Name == "get_PipboyEffectColor" && m.Parameters.Count == 0)
-            ?? throw new Exception("AppSettings::get_PipboyEffectColor not found");
 
         bool AlreadyHooks(MethodDefinition m) => m.Body.Instructions.Any(i =>
             i.OpCode == OpCodes.Ldstr && (i.Operand as string) == BridgeClassFqn);
         var setterHooked = AlreadyHooks(setter);
-        var getterHooked = AlreadyHooks(getter);
-        if (setterHooked && getterHooked)
-            return new(false, "AppSettings setter+getter already hook LEDBridge");
+        if (setterHooked)
+            return new(false, "AppSettings::set_PipboyEffectColor already hooks LEDBridge");
 
         // ---- Harvest existing FieldReferences for Color.r/g/b --------
         FieldReference? colorR = null, colorG = null, colorB = null;
@@ -1168,58 +1164,48 @@ static class LEDStickBridge
         // ---- Hook the SETTER (writes from F4 protocol + in-app picker)
         // Channel pusher reads (int)(val.<channel> * 255f) where val is
         // local 0 of the setter — the post-luma-boost Color.
-        if (!setterHooked)
+        Instruction[] PushSetterChannel(int idx)
         {
-            Instruction[] PushSetterChannel(int idx)
+            var fr = idx == 0 ? colorR! : idx == 1 ? colorG! : colorB!;
+            var il = setter.Body.GetILProcessor();
+            return new[]
             {
-                var fr = idx == 0 ? colorR! : idx == 1 ? colorG! : colorB!;
-                var il = setter.Body.GetILProcessor();
-                return new[]
-                {
-                    il.Create(OpCodes.Ldloca_S, setter.Body.Variables[0]),
-                    il.Create(OpCodes.Ldfld, fr),
-                    il.Create(OpCodes.Ldc_R4, 255f),
-                    il.Create(OpCodes.Mul),
-                    il.Create(OpCodes.Conv_I4),
-                };
-            }
-            InjectLEDBridgeCall(setter, cachedField, ajcCtor, callStatic, module, PushSetterChannel);
+                il.Create(OpCodes.Ldloca_S, setter.Body.Variables[0]),
+                il.Create(OpCodes.Ldfld, fr),
+                il.Create(OpCodes.Ldc_R4, 255f),
+                il.Create(OpCodes.Mul),
+                il.Create(OpCodes.Conv_I4),
+            };
         }
+        InjectLEDBridgeCall(setter, cachedField, ajcCtor, callStatic, module, PushSetterChannel);
 
-        // ---- Hook the GETTER (covers app-startup LED push) -----------
-        // Reads locals 0/1/2 = the float r/g/b loaded from PlayerPrefs.
-        // The first CompanionFlashMenu.Init after Unity comes up calls
-        // SetPipboyEffectColor(AppSettings.PipboyEffectColor) — that
-        // invokes this getter, so the LEDs reflect the saved PlayerPrefs
-        // colour on every launch even before F4 connects or the user
-        // touches the in-app picker. The smali helper's dedupe makes
-        // subsequent getter calls free.
-        if (!getterHooked)
-        {
-            Instruction[] PushGetterChannel(int idx)
-            {
-                var il = getter.Body.GetILProcessor();
-                return new[]
-                {
-                    il.Create(OpCodes.Ldloc, getter.Body.Variables[idx]),
-                    il.Create(OpCodes.Ldc_R4, 255f),
-                    il.Create(OpCodes.Mul),
-                    il.Create(OpCodes.Conv_I4),
-                };
-            }
-            InjectLEDBridgeCall(getter, cachedField, ajcCtor, callStatic, module, PushGetterChannel);
-        }
+        // NOTE: we previously also hooked the GETTER (so the very first
+        // CompanionFlashMenu.Init read of AppSettings.PipboyEffectColor
+        // would push the saved PlayerPrefs colour to the LEDs on
+        // startup, before F4 connects). That broke the screen-colour
+        // event chain — the getter sits in the hot path of menu Init,
+        // and any throw from the AndroidJavaClass call inside our
+        // injection unwound through `SetPipboyEffectColor(AppSettings
+        // .PipboyEffectColor)` before the menu could finish wiring up
+        // its PostEffect → event-subscriber chain. Result: F4's
+        // delta-color updates fired the setter and the event, but no
+        // menu was subscribed and the shader never moved.
+        //
+        // We keep ONLY the setter hook. On launch the LEDs sit at
+        // whatever was last applied (persists across the sysfs node)
+        // until the first F4 protocol tick or in-app picker action
+        // fires the setter; both happen within ~33 ms of connection.
+        //
+        // (If we ever want a guaranteed-on-startup push, the right
+        // place is a Launcher-activity-side smali call to LEDBridge
+        // .apply with a hard-coded sensible default — outside Unity's
+        // critical-path init.)
 
-        var msg = (setterHooked, getterHooked) switch
-        {
-            (false, false) => "setter+getter",
-            (true,  false) => "getter (setter already hooked)",
-            (false, true)  => "setter (getter already hooked)",
-            (true,  true)  => "(no change)",
-        };
         return new(true,
-            $"AppSettings {msg} → {BridgeClassFqn}.apply(r,g,b)"
-          + $" (cached AJC ref in {cachedFieldName})");
+            setterHooked
+              ? "(no change — setter already hooked)"
+              : $"AppSettings::set_PipboyEffectColor → {BridgeClassFqn}.apply(r,g,b)"
+              + $" (cached AJC ref in {cachedFieldName})");
     }
 
     // Insert an AndroidJavaClass-cached call to LEDBridge.apply(int,int,int)

@@ -145,7 +145,11 @@
     return-void
 .end method
 
-# Build "<idx>-<r>:<g>:<b>:<a>" string (Bifrost's wire format).
+# Build "<idx>-<r>:<g>:<b>:<a>\n" string (Bifrost's wire format).
+# Trailing newline matters — Bifrost composes shell `echo` redirects,
+# which always append \n, and the kernel driver returns EINVAL on
+# writes without it (verified: `printf '1-0:255:0:255' > /sys/.../brightness`
+# fails with "Invalid argument", `echo '1-0:255:0:255' > ...` succeeds).
 .method private static buildPayload(IIIII)Ljava/lang/String;
     .registers 8
     .param p0, "idx"
@@ -167,6 +171,8 @@
     invoke-virtual {v0, p3}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
     invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v0, p4}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v1, "\n"
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
     invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
     move-result-object v0
     return-object v0
