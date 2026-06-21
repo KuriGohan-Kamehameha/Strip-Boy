@@ -122,28 +122,457 @@ Predicated on A1 succeeding. Adds the LED write path with ZERO
 per-frame allocations using `UnityEngine.AndroidJNI.CallStaticVoidMethod`
 + a pre-allocated `jvalue[]`.
 
-**Per-frame work added on top of A1**:
-- Load `jvalueArr` static field (already alloc'd at first call)
-- `ldelema jvalue` (get address of element 0)
-- Store `fBrightness` into the `f` member of that jvalue
-- `AndroidJNI.CallStaticVoidMethod(classPtr, methodId, jvalueArr)`
+**Architecture split** — separate Java methods for color vs brightness
+so each Cecil hook injects minimal IL:
 
-`classPtr` and `methodId` are cached `IntPtr` static fields, looked up
-once via `AndroidJNI.FindClass` + `AndroidJNI.GetStaticMethodID` at
-the first call.
+| Smali method | Called from | Stores into |
+|---|---|---|
+| `applyColor(I,I,I)V` | SetColor hook (already shipped, rename) | pendingR/G/B |
+| `applyBrightness(F)V` | Update _Brightness tee (A2 hook) | pendingFB |
 
-The LEDBridge.smali side gets a new method
-`applyBrightness(float fB)` that just stores fB in a static field +
-posts to the existing HandlerThread.
+Both methods post the singleton writer Runnable to the existing
+HandlerThread. The writer reads all four pending fields and writes
+sysfs. Coalescing via `handler.removeCallbacks` keeps the queue at
+≤ 1 entry.
+
+**Per-frame IL on top of A1's dup+stsfld**:
+
+```
+; at the same site, immediately after stsfld _stripboyLastFB
+; (which left no value on the stack):
+
+; Ensure JNI handles cached (do this once)
+ldsfld _stripboyApplyBrightnessMethodId
+brtrue methodCached
+ldstr "io/pipboy/thor/LEDBridge"
+call UnityEngine.AndroidJNI::FindClass(string)
+stsfld _stripboyLEDBridgeClassPtr
+ldsfld _stripboyLEDBridgeClassPtr
+ldstr "applyBrightness"
+ldstr "(F)V"
+call UnityEngine.AndroidJNI::GetStaticMethodID(IntPtr, string, string)
+stsfld _stripboyApplyBrightnessMethodId
+methodCached:
+
+; Set jvalueArr[0].f = _stripboyLastFB
+ldsfld _stripboyJvalueArr
+ldc.i4.0
+ldelema UnityEngine.jvalue
+ldsfld _stripboyLastFB
+stfld UnityEngine.jvalue::f
+
+; AndroidJNI.CallStaticVoidMethod(classPtr, methodId, jvalueArr)
+ldsfld _stripboyLEDBridgeClassPtr
+ldsfld _stripboyApplyBrightnessMethodId
+ldsfld _stripboyJvalueArr
+call UnityEngine.AndroidJNI::CallStaticVoidMethod(IntPtr, IntPtr, UnityEngine.jvalue[])
+```
+
+Plus static-cctor work on PipboyPostEffect to allocate `_stripboyJvalueArr = new jvalue[1]` ONCE. After that: per-frame work is 4 sfld + 1 stfld + 1 native JNI call. No heap alloc.
+
+**Cecil sketch** (combines A1+A2 — call from a single `Apply`):
+
+```csharp
+static class FlickerSyncA2
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")!;
+        var update = type.Methods.First(m =>
+            m.Name == "Update" && m.Parameters.Count == 0);
+
+        if (type.Fields.Any(f => f.Name == "_stripboyLastFB"))
+            return new(false, "A2 already installed");
+
+        var unityRef = module.AssemblyReferences.First(a => a.Name == "UnityEngine");
+
+        // ---- Types ----
+        var intPtrType = module.ImportReference(typeof(IntPtr));
+        var jvalueType = new TypeReference("UnityEngine", "jvalue",
+            module, unityRef, valueType: true);
+        var jvalueArrType = new ArrayType(jvalueType);
+        var androidJniType = new TypeReference("UnityEngine", "AndroidJNI",
+            module, unityRef, valueType: false);
+
+        // ---- Method refs (no .Resolve()) ----
+        var findClass = new MethodReference("FindClass", intPtrType, androidJniType);
+        findClass.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var getStaticMethodID = new MethodReference("GetStaticMethodID",
+            intPtrType, androidJniType);
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(intPtrType));
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var callStaticVoid = new MethodReference("CallStaticVoidMethod",
+            module.TypeSystem.Void, androidJniType);
+        callStaticVoid.Parameters.Add(new ParameterDefinition(intPtrType));
+        callStaticVoid.Parameters.Add(new ParameterDefinition(intPtrType));
+        callStaticVoid.Parameters.Add(new ParameterDefinition(jvalueArrType));
+
+        var jvalueFloatField = new FieldReference("f",
+            module.TypeSystem.Single, jvalueType);
+
+        // ---- Static fields on PipboyPostEffect ----
+        var fbField = new FieldDefinition("_stripboyLastFB",
+            FieldAttributes.Private | FieldAttributes.Static,
+            module.TypeSystem.Single);
+        var classPtrField = new FieldDefinition("_stripboyLEDBridgeClassPtr",
+            FieldAttributes.Private | FieldAttributes.Static, intPtrType);
+        var methodIdField = new FieldDefinition("_stripboyApplyBrightnessMethodId",
+            FieldAttributes.Private | FieldAttributes.Static, intPtrType);
+        var jvalueArrField = new FieldDefinition("_stripboyJvalueArr",
+            FieldAttributes.Private | FieldAttributes.Static, jvalueArrType);
+        type.Fields.Add(fbField);
+        type.Fields.Add(classPtrField);
+        type.Fields.Add(methodIdField);
+        type.Fields.Add(jvalueArrField);
+
+        // ---- jvalueArr init in <cctor> ----
+        var cctor = type.GetStaticConstructor();
+        if (cctor is null)
+        {
+            cctor = new MethodDefinition(".cctor",
+                MethodAttributes.Private | MethodAttributes.Static
+                | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName
+                | MethodAttributes.HideBySig,
+                module.TypeSystem.Void);
+            cctor.Body = new MethodBody(cctor);
+            cctor.Body.GetILProcessor().Append(Instruction.Create(OpCodes.Ret));
+            type.Methods.Add(cctor);
+        }
+        var cctorIL = cctor.Body.GetILProcessor();
+        var cctorRet = cctor.Body.Instructions.Last(i => i.OpCode == OpCodes.Ret);
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Ldc_I4_1));
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Newarr, jvalueType));
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Stsfld, jvalueArrField));
+        if (cctor.Body.MaxStackSize < 1) cctor.Body.MaxStackSize = 1;
+
+        // ---- Find the _Brightness SetFloat sequence in Update ----
+        Instruction? brightCall = null;
+        foreach (var i in update.Body.Instructions)
+        {
+            if (i.OpCode != OpCodes.Ldstr || (i.Operand as string) != "_Brightness") continue;
+            var c = i.Next;
+            while (c != null)
+            {
+                if ((c.OpCode == OpCodes.Call || c.OpCode == OpCodes.Callvirt)
+                    && c.Operand is MethodReference mr && mr.Name == "QBrightness")
+                { brightCall = c; break; }
+                if (c.OpCode == OpCodes.Callvirt) break;
+                c = c.Next;
+            }
+            break;
+        }
+        if (brightCall is null) throw new Exception("QBrightness call not found");
+
+        var il = update.Body.GetILProcessor();
+        var methodCachedAnchor = il.Create(OpCodes.Ldsfld, classPtrField);
+
+        // After brightCall, the float fB is on the stack. Sequence:
+        //   dup; stsfld fbField; (A1 part)
+        //   if methodIdField is 0: do the FindClass + GetStaticMethodID dance
+        //   set jvalueArr[0].f = fbField
+        //   AndroidJNI.CallStaticVoidMethod(classPtr, methodId, jvalueArr)
+        var seq = new List<Instruction>
+        {
+            // A1: dup, stsfld _stripboyLastFB
+            il.Create(OpCodes.Dup),
+            il.Create(OpCodes.Stsfld, fbField),
+
+            // if (_stripboyApplyBrightnessMethodId.ToInt64() != 0) goto methodCachedAnchor
+            il.Create(OpCodes.Ldsfld, methodIdField),
+            // IntPtr.Zero check via call to IntPtr op_Inequality? Simpler:
+            // ldsfld IntPtr; ldsfld IntPtr.Zero; call op_Inequality (bool)
+            // For simplicity here, use brtrue on the IntPtr itself (non-zero IntPtr is "truthy" via unsigned cmp)
+            il.Create(OpCodes.Brtrue, methodCachedAnchor),
+
+            // _stripboyLEDBridgeClassPtr = AndroidJNI.FindClass("io/pipboy/thor/LEDBridge");
+            il.Create(OpCodes.Ldstr, "io/pipboy/thor/LEDBridge"),
+            il.Create(OpCodes.Call, findClass),
+            il.Create(OpCodes.Stsfld, classPtrField),
+
+            // _stripboyApplyBrightnessMethodId =
+            //     AndroidJNI.GetStaticMethodID(classPtr, "applyBrightness", "(F)V");
+            il.Create(OpCodes.Ldsfld, classPtrField),
+            il.Create(OpCodes.Ldstr, "applyBrightness"),
+            il.Create(OpCodes.Ldstr, "(F)V"),
+            il.Create(OpCodes.Call, getStaticMethodID),
+            il.Create(OpCodes.Stsfld, methodIdField),
+
+            // methodCachedAnchor:  (ldsfld classPtrField — reused as the cached load)
+            methodCachedAnchor,
+
+            // jvalueArr[0].f = _stripboyLastFB
+            il.Create(OpCodes.Ldsfld, jvalueArrField),
+            il.Create(OpCodes.Ldc_I4_0),
+            il.Create(OpCodes.Ldelema, jvalueType),
+            il.Create(OpCodes.Ldsfld, fbField),
+            il.Create(OpCodes.Stfld, jvalueFloatField),
+
+            // AndroidJNI.CallStaticVoidMethod(classPtr, methodId, jvalueArr)
+            // Note: the methodCachedAnchor ldsfld already pushed classPtr; we
+            // also need methodId and jvalueArr.
+            il.Create(OpCodes.Ldsfld, methodIdField),
+            il.Create(OpCodes.Ldsfld, jvalueArrField),
+            il.Create(OpCodes.Call, callStaticVoid),
+        };
+
+        var cursor = brightCall;
+        foreach (var ins in seq)
+        {
+            il.InsertAfter(cursor, ins);
+            cursor = ins;
+        }
+
+        if (update.Body.MaxStackSize < 6) update.Body.MaxStackSize = 6;
+
+        return new(true, "PipboyPostEffect::Update _Brightness tee'd → A2 JNI path");
+    }
+}
+```
+
+**Smali addition for A2** — append to `LEDBridge.smali`:
+
+```smali
+.method public static applyBrightness(F)V
+    .registers 4
+    .param p0, "fBrightness"
+
+    sput p0, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    return-void
+.end method
+```
+
+Writer already reads `pendingFB`. No other changes.
 
 **Hypothesis**: if A1 worked but A2 breaks → the JNI call itself is
-the culprit (sync barrier, GC interaction). Throttle: only call A2's
-JNI once every N frames.
+the culprit (sync barrier, GC interaction). Throttle: gate the JNI
+call on a frame counter, fire only every Nth frame.
 
-If A2 works → ship it. We've achieved flicker sync with zero
-per-frame allocations.
+---
 
-**Cecil sketch deferred** — only worth writing if A1 succeeds.
+### Experiment C — Sidekick APK (the user's "Bifrost plugin" framing)
+
+A standalone tiny APK, `io.pipboy.thor.flickerd`, lives alongside
+Strip-Boy. Owns all LED writes. Receives colour via broadcast
+intent. Generates Perlin-ish flicker on its own timer.
+
+**`flickerd/AndroidManifest.xml`**:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.pipboy.thor.flickerd">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
+    <application
+        android:label="Strip-Boy Flickerd"
+        android:icon="@android:drawable/sym_def_app_icon">
+
+        <service
+            android:name=".TickerService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="LED control loop for Strip-Boy"/>
+        </service>
+
+        <receiver
+            android:name=".ColorReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.pipboy.thor.SET_COLOR"/>
+                <action android:name="io.pipboy.thor.STOP"/>
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+```
+
+**`flickerd/src/io/pipboy/thor/flickerd/ColorReceiver.java`**:
+
+```java
+package io.pipboy.thor.flickerd;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+public class ColorReceiver extends BroadcastReceiver {
+    @Override
+    public void onReceive(Context ctx, Intent intent) {
+        String action = intent.getAction();
+        if ("io.pipboy.thor.SET_COLOR".equals(action)) {
+            int r = intent.getIntExtra("r", 0);
+            int g = intent.getIntExtra("g", 0);
+            int b = intent.getIntExtra("b", 0);
+            TickerService.updateColor(r, g, b);
+            // Ensure the ticker is alive
+            Intent svc = new Intent(ctx, TickerService.class);
+            ctx.startForegroundService(svc);
+        } else if ("io.pipboy.thor.STOP".equals(action)) {
+            ctx.stopService(new Intent(ctx, TickerService.class));
+        }
+    }
+}
+```
+
+**`flickerd/src/io/pipboy/thor/flickerd/TickerService.java`**:
+
+```java
+package io.pipboy.thor.flickerd;
+
+import android.app.*;
+import android.content.*;
+import android.os.*;
+import android.provider.Settings;
+import java.io.FileOutputStream;
+
+public class TickerService extends Service {
+    private static volatile int colorR, colorG, colorB;
+    private static volatile boolean haveColor;
+
+    private HandlerThread thread;
+    private Handler handler;
+    private long startMillis;
+
+    public static void updateColor(int r, int g, int b) {
+        colorR = r; colorG = g; colorB = b;
+        haveColor = true;
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        startForeground(1, buildNotif());
+        thread = new HandlerThread("strip-boy-flickerd");
+        thread.start();
+        handler = new Handler(thread.getLooper());
+        startMillis = System.currentTimeMillis();
+        handler.post(tick);
+    }
+
+    private final Runnable tick = new Runnable() {
+        @Override public void run() {
+            try {
+                if (haveColor) writeLeds();
+            } catch (Throwable t) { /* swallow */ }
+            handler.postDelayed(this, 33);   // ~30 Hz
+        }
+    };
+
+    private void writeLeds() throws Exception {
+        // Sub-1Hz pulse base + occasional flicker dip
+        long t = System.currentTimeMillis() - startMillis;
+        double phase = (t % 5000) / 5000.0 * 2 * Math.PI;
+        double pulse = 0.85 + 0.15 * Math.sin(phase);
+        double flicker = (Math.random() < 0.04)
+            ? 0.3 + Math.random() * 0.3
+            : 1.0;
+        double mult = Math.min(1.0, pulse * flicker);
+
+        int bottom = Settings.System.getInt(getContentResolver(),
+            "dual_screen_brightness_level", 50);
+        // 5% ceiling × bottom% × mult, applied to RGB magnitudes
+        double scale = bottom * 0.1275 / 255.0 * mult;
+
+        int r = (int)(colorR * scale);
+        int g = (int)(colorG * scale);
+        int b = (int)(colorB * scale);
+
+        String payload = "1-" + r + ":" + g + ":" + b + ":255\n";
+        for (String path : new String[]{
+                "/sys/class/sn3112l/led/brightness",
+                "/sys/class/sn3112r/led/brightness"}) {
+            try (FileOutputStream f = new FileOutputStream(path)) {
+                f.write(payload.getBytes());
+            }
+        }
+    }
+
+    private Notification buildNotif() {
+        String chId = "flickerd";
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm.getNotificationChannel(chId) == null) {
+            nm.createNotificationChannel(new NotificationChannel(
+                chId, "Strip-Boy LED", NotificationManager.IMPORTANCE_MIN));
+        }
+        return new Notification.Builder(this, chId)
+            .setContentTitle("Strip-Boy LED")
+            .setSmallIcon(android.R.drawable.sym_def_app_icon)
+            .build();
+    }
+
+    @Override public int onStartCommand(Intent i, int f, int s) { return START_STICKY; }
+    @Override public IBinder onBind(Intent i) { return null; }
+    @Override public void onDestroy() {
+        super.onDestroy();
+        if (thread != null) thread.quitSafely();
+    }
+}
+```
+
+**`flickerd/build.gradle`**:
+
+```groovy
+plugins { id 'com.android.application' }
+android {
+    namespace 'io.pipboy.thor.flickerd'
+    compileSdk 34
+    defaultConfig {
+        applicationId "io.pipboy.thor.flickerd"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    buildTypes { release { minifyEnabled false } }
+}
+```
+
+**Strip-Boy side change** — replace the `LEDBridge.apply` AJC call in
+the SetColor hook with an `Activity.sendBroadcast(Intent)`. Smali
+becomes:
+
+```smali
+# In place of AndroidJavaClass.CallStatic("apply", ...):
+#   Intent i = new Intent("io.pipboy.thor.SET_COLOR")
+#       .putExtra("r", r).putExtra("g", g).putExtra("b", b);
+#   UnityPlayer.currentActivity.sendBroadcast(i);
+```
+
+About 15 IL instructions. No object[], no Java-side handler in
+Strip-Boy at all (just the broadcast send). Sidekick owns the rest.
+
+**Install order**: `adb install flickerd.apk` then
+`adb install strip-boy.apk`. Strip-Boy detects flickerd via
+`PackageManager.getPackageInfo("io.pipboy.thor.flickerd", 0)` (no
+permission needed) and uses the broadcast path; otherwise falls back
+to the direct-sysfs path it already has.
+
+---
+
+## Investigation status
+
+| Tick | Output |
+|------|--------|
+| 1 | Identified three experiments (A, B, C). Picked SetFloat tee as smallest test. |
+| 2 | Sketched A1 Cecil patch (minimal IL, no JNI). Doc committed. |
+| 3 | Sketched A2 Cecil (zero-alloc JNI via jvalue[]) and C (sidekick APK skeleton). Doc committed. |
+
+Pick-order when at the keyboard: **A1 → A2 → C**. A1 takes 5 min and
+disambiguates the entire investigation.
 
 ---
 
