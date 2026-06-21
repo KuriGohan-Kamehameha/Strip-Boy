@@ -163,6 +163,7 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
+    ("FlickerSeed",               FlickerSeed.Apply),
     // B disabled — on-device test 2026-06-21 affected the shader
     // (gradient banding less severe than the original Update-hook
     // failure, but still visible). Per-frame AJC.CallStatic has
@@ -210,6 +211,158 @@ return 0;
 /* ===================================================================== */
 
 readonly record struct PatchResult(bool Changed, string Message);
+
+// FlickerSeed — make the screen's flicker deterministic + seed-matched with
+// the Bifrost PIPBOY plugin, so the stick LEDs reproduce the screen's exact
+// flicker sequence with no runtime signalling.
+//
+// Three injections into PipboyPostEffect:
+//   1. A dedicated seeded LCG (static int _stripboyFlickerRng = SEED) plus a
+//      _stripboyFlickerRange(float,float) method — bit-identical maths to the
+//      plugin's seededRange (Numerical-Recipes LCG, value/2^32).
+//   2. Redirect the flicker Random.Range calls in Update (the duration/delay
+//      draws + the burst-chance roll, isolated to the window between the
+//      bFlickering toggle and the first PerlinNoise) to that seeded method.
+//      Call-target swap only — A1-class IL, which the renderer tolerates.
+//   3. Tee the per-frame fTime into a public static _stripboyFTime (read by
+//      LEDBridge.smali) so the plugin can fast-forward to the screen's clock.
+//
+// SEED + LCG constants MUST equal PipBoyAnimation.FLICKER_SEED/LCG_MUL/LCG_ADD.
+static class FlickerSeed
+{
+    const int SEED = 0x50B0FF;
+    const int LCG_MUL = 1664525;
+    const int LCG_ADD = 1013904223;
+
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+        var update = type.Methods.FirstOrDefault(m =>
+            m.Name == "Update" && m.Parameters.Count == 0)
+            ?? throw new Exception("PipboyPostEffect::Update() not found");
+
+        const string rngFieldName = "_stripboyFlickerRng";
+        if (type.Fields.Any(f => f.Name == rngFieldName))
+            return new(false, "FlickerSeed already installed");
+
+        // ---- fields ----
+        var rngField = new FieldDefinition(rngFieldName,
+            FieldAttributes.Private | FieldAttributes.Static, module.TypeSystem.Int32);
+        type.Fields.Add(rngField);
+        var fTimeField = new FieldDefinition("_stripboyFTime",
+            FieldAttributes.Public | FieldAttributes.Static, module.TypeSystem.Single);
+        type.Fields.Add(fTimeField);
+
+        // ---- seed in <cctor> ----
+        var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
+        if (cctor is null)
+        {
+            cctor = new MethodDefinition(".cctor",
+                MethodAttributes.Private | MethodAttributes.Static
+                | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName
+                | MethodAttributes.HideBySig, module.TypeSystem.Void);
+            cctor.Body = new MethodBody(cctor);
+            cctor.Body.GetILProcessor().Append(Instruction.Create(OpCodes.Ret));
+            type.Methods.Add(cctor);
+        }
+        var cil = cctor.Body.GetILProcessor();
+        var cret = cctor.Body.Instructions.Last(i => i.OpCode == OpCodes.Ret);
+        cil.InsertBefore(cret, cil.Create(OpCodes.Ldc_I4, SEED));
+        cil.InsertBefore(cret, cil.Create(OpCodes.Stsfld, rngField));
+        if (cctor.Body.MaxStackSize < 1) cctor.Body.MaxStackSize = 1;
+
+        // ---- _stripboyFlickerRange(float,float) : float ----
+        var range = new MethodDefinition("_stripboyFlickerRange",
+            MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Single);
+        range.Parameters.Add(new ParameterDefinition("lo", ParameterAttributes.None, module.TypeSystem.Single));
+        range.Parameters.Add(new ParameterDefinition("hi", ParameterAttributes.None, module.TypeSystem.Single));
+        range.Body = new MethodBody(range);
+        range.Body.Variables.Add(new VariableDefinition(module.TypeSystem.Double)); // [0] frac
+        range.Body.InitLocals = true;
+        var ril = range.Body.GetILProcessor();
+        // _rng = _rng * MUL + ADD  (int32 overflow == uint overflow bit pattern)
+        ril.Append(ril.Create(OpCodes.Ldsfld, rngField));
+        ril.Append(ril.Create(OpCodes.Ldc_I4, LCG_MUL));
+        ril.Append(ril.Create(OpCodes.Mul));
+        ril.Append(ril.Create(OpCodes.Ldc_I4, LCG_ADD));
+        ril.Append(ril.Create(OpCodes.Add));
+        ril.Append(ril.Create(OpCodes.Stsfld, rngField));
+        // frac = (double)(uint)_rng / 2^32
+        ril.Append(ril.Create(OpCodes.Ldsfld, rngField));
+        ril.Append(ril.Create(OpCodes.Conv_U8));   // zero-extend int32→int64 (unsigned value)
+        ril.Append(ril.Create(OpCodes.Conv_R8));
+        ril.Append(ril.Create(OpCodes.Ldc_R8, 4294967296.0));
+        ril.Append(ril.Create(OpCodes.Div));
+        ril.Append(ril.Create(OpCodes.Stloc_0));
+        // return (float)(lo + frac*(hi-lo))
+        ril.Append(ril.Create(OpCodes.Ldarg_0));
+        ril.Append(ril.Create(OpCodes.Conv_R8));
+        ril.Append(ril.Create(OpCodes.Ldarg_1));
+        ril.Append(ril.Create(OpCodes.Conv_R8));
+        ril.Append(ril.Create(OpCodes.Ldarg_0));
+        ril.Append(ril.Create(OpCodes.Conv_R8));
+        ril.Append(ril.Create(OpCodes.Sub));
+        ril.Append(ril.Create(OpCodes.Ldloc_0));
+        ril.Append(ril.Create(OpCodes.Mul));
+        ril.Append(ril.Create(OpCodes.Add));
+        ril.Append(ril.Create(OpCodes.Conv_R4));
+        ril.Append(ril.Create(OpCodes.Ret));
+        range.Body.MaxStackSize = 4;
+        type.Methods.Add(range);
+
+        // ---- tee fTime: after `stfld fTime` near the top of Update ----
+        var instrs = update.Body.Instructions;
+        Instruction? fTimeStore = instrs.FirstOrDefault(i =>
+            i.OpCode == OpCodes.Stfld && i.Operand is FieldReference fr && fr.Name == "fTime");
+        if (fTimeStore is null) throw new Exception("fTime store not found in Update");
+        var uil = update.Body.GetILProcessor();
+        var teeC = uil.Create(OpCodes.Stsfld, fTimeField);
+        var teeB = uil.Create(OpCodes.Ldfld, new FieldReference("fTime", module.TypeSystem.Single, type));
+        var teeA = uil.Create(OpCodes.Ldarg_0);
+        uil.InsertAfter(fTimeStore, teeA);
+        uil.InsertAfter(teeA, teeB);
+        uil.InsertAfter(teeB, teeC);
+
+        // ---- redirect flicker Random.Range calls ----
+        // Window: from the bFlickering toggle (stfld bFlickering) to the first
+        // Mathf.PerlinNoise call. Excludes the earlier vscan Random.Range.
+        int toggleIdx = -1, perlinIdx = -1;
+        for (int i = 0; i < instrs.Count; i++)
+        {
+            var ins = instrs[i];
+            if (toggleIdx < 0 && ins.OpCode == OpCodes.Stfld
+                && ins.Operand is FieldReference bf && bf.Name == "bFlickering")
+                toggleIdx = i;
+            if (toggleIdx >= 0 && ins.Operand is MethodReference pm
+                && pm.Name == "PerlinNoise") { perlinIdx = i; break; }
+        }
+        if (toggleIdx < 0 || perlinIdx < 0)
+            throw new Exception("flicker window (bFlickering..PerlinNoise) not found");
+
+        int redirected = 0;
+        for (int i = toggleIdx; i < perlinIdx; i++)
+        {
+            var ins = instrs[i];
+            if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                && ins.Operand is MethodReference mr
+                && mr.Name == "Range" && mr.DeclaringType.Name == "Random"
+                && mr.Parameters.Count == 2
+                && mr.Parameters[0].ParameterType.MetadataType == MetadataType.Single)
+            {
+                ins.OpCode = OpCodes.Call;
+                ins.Operand = range;
+                redirected++;
+            }
+        }
+        if (redirected == 0) throw new Exception("no flicker Random.Range calls redirected");
+
+        return new(true,
+            $"PipboyPostEffect flicker seeded (SEED=0x{SEED:X}); redirected {redirected} "
+          + $"Random.Range call(s) + tee'd fTime → _stripboyFTime");
+    }
+}
 
 static class LoopbackDiscovery
 {
@@ -1630,10 +1783,15 @@ static class LEDStickBridge
             seq.Add(il.Create(OpCodes.Stelem_Ref));
         }
 
-        // arr[3] = 1.0f  (no per-frame fBrightness available here)
+        // arr[3] = PipboyPostEffect._stripboyFTime (the screen's elapsed flicker
+        // clock, tee'd by FlickerSeed). LEDBridge forwards it to Bifrost as
+        // "phaseSeconds" so the plugin fast-forwards its seeded flicker sim to
+        // the screen's exact state. Falls back to 0 if FlickerSeed isn't applied
+        // (the field still exists as a static; default 0 just means "start now").
+        var fTimeRef = new FieldReference("_stripboyFTime", module.TypeSystem.Single, type);
         seq.Add(il.Create(OpCodes.Dup));
         seq.Add(il.Create(OpCodes.Ldc_I4_3));
-        seq.Add(il.Create(OpCodes.Ldc_R4, 1f));
+        seq.Add(il.Create(OpCodes.Ldsfld, fTimeRef));
         seq.Add(il.Create(OpCodes.Box, module.TypeSystem.Single));
         seq.Add(il.Create(OpCodes.Stelem_Ref));
 

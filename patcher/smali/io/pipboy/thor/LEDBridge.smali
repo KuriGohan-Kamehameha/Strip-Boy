@@ -257,6 +257,13 @@
     const-string v3, "EXPLICIT_CLEAR"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
+    # phaseSeconds = pendingFB (the screen's fTime, passed as apply()'s 4th arg
+    # by the FlickerSeed-aware LEDStickBridge). Bifrost's PIPBOY effect uses it
+    # to fast-forward its seeded flicker sim to the screen's exact state.
+    const-string v2, "phaseSeconds"
+    sget v3, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;F)Landroid/content/Intent;
+
     # activity.sendBroadcast(intent)
     invoke-virtual {v0, v1}, Landroid/app/Activity;->sendBroadcast(Landroid/content/Intent;)V
 
