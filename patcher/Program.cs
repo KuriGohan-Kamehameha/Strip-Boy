@@ -163,9 +163,13 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
-    // Experiment A1 is implemented in patcher/Program.cs as FlickerProbeA1
-    // but intentionally not registered here. To enable, add:
-    //   ("FlickerProbeA1",            FlickerProbeA1.Apply),
+    // Experiments A1 + A2 are implemented in patcher/Program.cs as
+    // FlickerProbeA1 and FlickerSyncA2 but intentionally not registered
+    // here. To enable, uncomment the line(s) you want:
+    //
+    //   ("FlickerProbeA1",            FlickerProbeA1.Apply),   // A1 alone
+    //   ("FlickerSyncA2",             FlickerSyncA2.Apply),   // A2 (subsumes A1)
+    //
     // See docs/FLICKER_EXPERIMENTS.md for context.
 };
 
@@ -1146,6 +1150,202 @@ static class FlickerProbeA1
         return new(true,
             $"PipboyPostEffect::Update _Brightness SetFloat tee'd into static "
           + $"{fieldName} at IL_{brightnessSetFloat.Offset:X4} (no JNI, no work)");
+    }
+}
+
+// Experiment A2 — full per-frame LED brightness write with ZERO heap
+// allocations. Subsumes Experiment A1 (FlickerProbeA1): also tees the
+// per-frame _Brightness into _stripboyLastFB AND pushes it to Java via
+// raw AndroidJNI using a cached classPtr + methodID + pre-allocated
+// jvalue[]. No object[], no boxing, no AndroidJavaClass.
+//
+// Per-frame work added to PipboyPostEffect::Update at the
+// Material.SetFloat("_Brightness", ...) call site:
+//   - dup; stsfld _stripboyLastFB           (A1 tee — only if A1 isn't
+//                                            already there)
+//   - 1× brtrue (cache hit check on the methodID handle)
+//   - On hit (every frame after first): 4× ldsfld, ldelema, stfld,
+//     3× ldsfld, 1× call
+//   - On miss (first call only): ldstr×3, call FindClass, stsfld,
+//     ldsfld, ldstr×2, call GetStaticMethodID, stsfld
+// Steady state: ~9 instructions, 0 alloc.
+//
+// Static cctor on PipboyPostEffect is extended to do
+//   _stripboyJvalueArr = new jvalue[1]
+// once at type init, so the array exists by first Update call.
+//
+// REQUIRES io.pipboy.thor.LEDBridge::applyBrightness(F)V to exist on
+// the Java side (added to patcher/smali/io/pipboy/thor/LEDBridge.smali
+// in the same commit as this class).
+//
+// NOT registered in the patches[] array. To enable, insert
+//   ("FlickerSyncA2", FlickerSyncA2.Apply),
+// after FlickerProbeA1 in the patches list and rebuild Strip-Boy. If
+// A1 is also enabled, A2 detects it (via the fb-field presence) and
+// skips its own redundant tee.
+static class FlickerSyncA2
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+        var update = type.Methods.FirstOrDefault(m =>
+            m.Name == "Update" && m.Parameters.Count == 0)
+            ?? throw new Exception("PipboyPostEffect::Update() not found");
+
+        // Idempotence — keyed off the JNI-handle field that ONLY A2 adds.
+        const string classPtrFieldName = "_stripboyLEDBridgeClassPtr";
+        if (type.Fields.Any(f => f.Name == classPtrFieldName))
+            return new(false, "FlickerSyncA2 already installed");
+
+        // ---- Type references ----------------------------------------------
+        var unityRef = module.AssemblyReferences.FirstOrDefault(a => a.Name == "UnityEngine")
+            ?? throw new Exception("UnityEngine assembly reference not present");
+        var intPtrType = new TypeReference("System", "IntPtr",
+            module, module.TypeSystem.CoreLibrary, valueType: true);
+        var jvalueType = new TypeReference("UnityEngine", "jvalue",
+            module, unityRef, valueType: true);
+        var jvalueArrType = new ArrayType(jvalueType);
+        var androidJniType = new TypeReference("UnityEngine", "AndroidJNI",
+            module, unityRef, valueType: false);
+
+        // ---- AndroidJNI static method refs --------------------------------
+        var findClass = new MethodReference("FindClass", intPtrType, androidJniType);
+        findClass.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var getStaticMethodID = new MethodReference("GetStaticMethodID",
+            intPtrType, androidJniType);
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(intPtrType));
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+        getStaticMethodID.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+
+        var callStaticVoid = new MethodReference("CallStaticVoidMethod",
+            module.TypeSystem.Void, androidJniType);
+        callStaticVoid.Parameters.Add(new ParameterDefinition(intPtrType));
+        callStaticVoid.Parameters.Add(new ParameterDefinition(intPtrType));
+        callStaticVoid.Parameters.Add(new ParameterDefinition(jvalueArrType));
+
+        var jvalueFloatField = new FieldReference("f",
+            module.TypeSystem.Single, jvalueType);
+
+        // ---- Fields (reuse A1's fb-field if present) ----------------------
+        const string fbFieldName = "_stripboyLastFB";
+        bool needTee = !type.Fields.Any(f => f.Name == fbFieldName);
+        var fbField = type.Fields.FirstOrDefault(f => f.Name == fbFieldName);
+        if (fbField is null)
+        {
+            fbField = new FieldDefinition(fbFieldName,
+                FieldAttributes.Private | FieldAttributes.Static,
+                module.TypeSystem.Single);
+            type.Fields.Add(fbField);
+        }
+        var classPtrField = new FieldDefinition(classPtrFieldName,
+            FieldAttributes.Private | FieldAttributes.Static, intPtrType);
+        var methodIdField = new FieldDefinition("_stripboyApplyBrightnessMethodId",
+            FieldAttributes.Private | FieldAttributes.Static, intPtrType);
+        var jvalueArrField = new FieldDefinition("_stripboyJvalueArr",
+            FieldAttributes.Private | FieldAttributes.Static, jvalueArrType);
+        type.Fields.Add(classPtrField);
+        type.Fields.Add(methodIdField);
+        type.Fields.Add(jvalueArrField);
+
+        // ---- jvalueArr init in <cctor> ------------------------------------
+        var cctor = type.Methods.FirstOrDefault(m => m.Name == ".cctor");
+        if (cctor is null)
+        {
+            cctor = new MethodDefinition(".cctor",
+                MethodAttributes.Private | MethodAttributes.Static
+                | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName
+                | MethodAttributes.HideBySig,
+                module.TypeSystem.Void);
+            cctor.Body = new MethodBody(cctor);
+            cctor.Body.GetILProcessor().Append(Instruction.Create(OpCodes.Ret));
+            type.Methods.Add(cctor);
+        }
+        var cctorIL = cctor.Body.GetILProcessor();
+        var cctorRet = cctor.Body.Instructions.Last(i => i.OpCode == OpCodes.Ret);
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Ldc_I4_1));
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Newarr, jvalueType));
+        cctorIL.InsertBefore(cctorRet, cctorIL.Create(OpCodes.Stsfld, jvalueArrField));
+        if (cctor.Body.MaxStackSize < 1) cctor.Body.MaxStackSize = 1;
+
+        // ---- Find the Material.SetFloat("_Brightness", ...) call site ----
+        Instruction? brightnessSetFloat = null;
+        foreach (var i in update.Body.Instructions)
+        {
+            if (i.OpCode != OpCodes.Ldstr || (i.Operand as string) != "_Brightness") continue;
+            var c = i.Next;
+            while (c != null)
+            {
+                if ((c.OpCode == OpCodes.Callvirt || c.OpCode == OpCodes.Call)
+                    && c.Operand is MethodReference mr
+                    && mr.Name == "SetFloat"
+                    && mr.DeclaringType.Name == "Material")
+                {
+                    brightnessSetFloat = c;
+                    break;
+                }
+                c = c.Next;
+            }
+            if (brightnessSetFloat != null) break;
+        }
+        if (brightnessSetFloat is null)
+            throw new Exception("Material::SetFloat(\"_Brightness\", ...) call not found in Update");
+
+        // ---- Build IL sequence --------------------------------------------
+        var il = update.Body.GetILProcessor();
+        // Anchor: first instruction AFTER the cache-init branch.
+        var afterCacheInit = il.Create(OpCodes.Ldsfld, jvalueArrField);
+
+        var seq = new List<Instruction>();
+        if (needTee)
+        {
+            seq.Add(il.Create(OpCodes.Dup));
+            seq.Add(il.Create(OpCodes.Stsfld, fbField));
+        }
+
+        // if (methodIdField != IntPtr.Zero) goto afterCacheInit
+        seq.Add(il.Create(OpCodes.Ldsfld, methodIdField));
+        seq.Add(il.Create(OpCodes.Brtrue, afterCacheInit));
+
+        // classPtrField = AndroidJNI.FindClass("io/pipboy/thor/LEDBridge");
+        seq.Add(il.Create(OpCodes.Ldstr, "io/pipboy/thor/LEDBridge"));
+        seq.Add(il.Create(OpCodes.Call, findClass));
+        seq.Add(il.Create(OpCodes.Stsfld, classPtrField));
+
+        // methodIdField = AndroidJNI.GetStaticMethodID(classPtrField, "applyBrightness", "(F)V");
+        seq.Add(il.Create(OpCodes.Ldsfld, classPtrField));
+        seq.Add(il.Create(OpCodes.Ldstr, "applyBrightness"));
+        seq.Add(il.Create(OpCodes.Ldstr, "(F)V"));
+        seq.Add(il.Create(OpCodes.Call, getStaticMethodID));
+        seq.Add(il.Create(OpCodes.Stsfld, methodIdField));
+
+        // afterCacheInit:  ldsfld jvalueArr  (this IS afterCacheInit; we
+        // ldelema [0] from it next, then stfld jvalue::f)
+        seq.Add(afterCacheInit);
+        seq.Add(il.Create(OpCodes.Ldc_I4_0));
+        seq.Add(il.Create(OpCodes.Ldelema, jvalueType));
+        seq.Add(il.Create(OpCodes.Ldsfld, fbField));
+        seq.Add(il.Create(OpCodes.Stfld, jvalueFloatField));
+
+        // AndroidJNI.CallStaticVoidMethod(classPtrField, methodIdField, jvalueArr)
+        seq.Add(il.Create(OpCodes.Ldsfld, classPtrField));
+        seq.Add(il.Create(OpCodes.Ldsfld, methodIdField));
+        seq.Add(il.Create(OpCodes.Ldsfld, jvalueArrField));
+        seq.Add(il.Create(OpCodes.Call, callStaticVoid));
+
+        foreach (var ins in seq)
+            il.InsertBefore(brightnessSetFloat, ins);
+
+        // Cache-init path stacks classPtr + 2 strings = 3; tee path adds 1.
+        // SetFloat itself wants 3 args (this, string, float). 8 is safe.
+        if (update.Body.MaxStackSize < 8) update.Body.MaxStackSize = 8;
+
+        return new(true,
+            $"PipboyPostEffect::Update _Brightness tee'd + JNI-pushed via "
+          + $"cached jvalue[] (zero per-frame alloc) "
+          + $"{(needTee ? "[+A1 tee]" : "[reused existing A1 tee]")} "
+          + $"at IL_{brightnessSetFloat.Offset:X4}");
     }
 }
 

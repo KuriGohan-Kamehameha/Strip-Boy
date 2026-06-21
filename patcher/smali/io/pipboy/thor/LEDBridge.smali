@@ -125,6 +125,30 @@
 .end method
 
 
+# Per-frame brightness update. Called from Experiment A2's Cecil patch
+# (PipboyPostEffect::Update _Brightness SetFloat tee) via raw AndroidJNI
+# CallStaticVoidMethod (zero-allocation path). Updates pendingFB only;
+# colour stays whatever the last apply() set. Posts the same writer that
+# apply() does, so the existing HandlerThread coalescing applies.
+#
+# Dead code unless FlickerSyncA2 is registered in the patcher's
+# patches[] array. Harmless when unused: the method exists in dex but
+# nothing calls it.
+.method public static applyBrightness(F)V
+    .registers 4
+    .param p0, "fBrightness"
+
+    sput p0, Lio/pipboy/thor/LEDBridge;->pendingFB:F
+
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    return-void
+.end method
+
+
 # Background-thread writer. Saturates, computes alpha, dedupes,
 # writes both sticks. Wraps everything in try/catch so a failure
 # never propagates to the main thread (the handler thread keeps
