@@ -213,9 +213,9 @@
     const/4 v3, 0x1
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
 
-    # putExtra("effect", "SPARKLE")
+    # putExtra("effect", "PIPBOY")
     const-string v2, "effect"
-    const-string v3, "SPARKLE"
+    const-string v3, "PIPBOY"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
     # color = 0xFF000000 | (r<<16) | (g<<8) | b
