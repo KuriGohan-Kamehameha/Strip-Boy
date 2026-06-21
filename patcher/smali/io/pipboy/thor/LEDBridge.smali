@@ -218,24 +218,29 @@
     const-string v3, "PIPBOY"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
-    # color = 0xFF000000 | (r<<16) | (g<<8) | b
-    const/high16 v5, -0x1000000      # 0xFF000000 (signed alpha byte)
-    shl-int/lit8 v6, p0, 0x10
-    or-int v5, v5, v6
-    shl-int/lit8 v6, p1, 0x8
-    or-int v5, v5, v6
-    or-int v5, v5, p2
+    # color = 0xFF00FF00 (Pip-Boy green default).
+    # The screen tint (p0/p1/p2) is intentionally ignored for now: at app
+    # start / in menus it is blue/white, not the Pip-Boy colour. Tracking the
+    # real in-game HUD EffectColor is a TODO via HUDColorBridge once the game
+    # is connected. Until then the sticks default to Pip-Boy green.
+    const/high16 v5, -0x1000000      # 0xFF000000 alpha
+    const/16 v6, 0xff
+    shl-int/lit8 v6, v6, 0x8         # 0x0000FF00
+    or-int v5, v5, v6                # 0xFF00FF00
     const-string v2, "color"
     invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
     const-string v2, "colorRight"
     invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
 
-    # intensity = 100 on intensityScale = 2000 (~5% of 255 = 12.75)
+    # intensity = 128 / 255 (~50%). 5% collapsed into the LED PWM
+    # quantization floor and read as on/off rather than a smooth breath;
+    # ~50% keeps the 0.5..1.0 pulse envelope in a smoothly-renderable band.
+    # This is the brightness tuning knob.
     const-string v2, "intensity"
-    const/16 v3, 0x64        # 100
+    const/16 v3, 0x80        # 128
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
     const-string v2, "intensityScale"
-    const/16 v3, 0x7d0       # 2000
+    const/16 v3, 0xff        # 255
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
 
     # speed = 0.7f (lively but not seizure-inducing)
