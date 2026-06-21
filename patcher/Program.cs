@@ -163,6 +163,10 @@ var patches = new (string Name, Func<ModuleDefinition, PatchResult> Apply)[]
     ("AutoPickFullscreenMode",    AutoPickFullscreenMode.Apply),
     ("HUDColorBridge",            HUDColorBridge.Apply),
     ("LEDStickBridge",            LEDStickBridge.Apply),
+    // Experiment A1 is implemented in patcher/Program.cs as FlickerProbeA1
+    // but intentionally not registered here. To enable, add:
+    //   ("FlickerProbeA1",            FlickerProbeA1.Apply),
+    // See docs/FLICKER_EXPERIMENTS.md for context.
 };
 
 var anyChanged = false;
@@ -1064,6 +1068,85 @@ static class HUDColorBridge
         3 => il.Create(OpCodes.Ldc_I4_3),
         _ => il.Create(OpCodes.Ldc_I4, v),
     };
+}
+
+// Experiment A1 — minimal IL probe. Tees the per-frame _Brightness
+// value into a static field PipboyPostEffect::_stripboyLastFB but
+// does nothing else. Purpose: determine whether IL injection into
+// PipboyPostEffect.Update is itself poisonous (vs. specifically the
+// JNI / boxing path of earlier attempts).
+//
+// NOT registered in the patches[] array. To enable, insert
+//   ("FlickerProbeA1", FlickerProbeA1.Apply),
+// into the patches array above and rebuild Strip-Boy.
+//
+// If shader survives this probe -> the per-frame Update body tolerates
+// IL injection; the prior breakage was Material.GetColor / JNI / GC.
+// Proceed to Experiment A2 (full LED write via cached jvalue[]).
+//
+// If shader breaks anyway -> in-process per-frame work is not viable;
+// fall back to Experiment C (flickerd sidekick APK).
+static class FlickerProbeA1
+{
+    public static PatchResult Apply(ModuleDefinition module)
+    {
+        var type = module.GetType("PipboyPostEffect")
+            ?? throw new Exception("PipboyPostEffect type not found");
+
+        var update = type.Methods.FirstOrDefault(m =>
+            m.Name == "Update" && m.Parameters.Count == 0)
+            ?? throw new Exception("PipboyPostEffect::Update() not found");
+
+        const string fieldName = "_stripboyLastFB";
+        if (type.Fields.Any(f => f.Name == fieldName))
+            return new(false, "FlickerProbeA1 already installed");
+
+        // Find Material.SetFloat("_Brightness", ...) call site by walking
+        // forward from each `ldstr "_Brightness"` for the nearest matching
+        // Callvirt/Call to a SetFloat method on Material.
+        Instruction? brightnessSetFloat = null;
+        foreach (var i in update.Body.Instructions)
+        {
+            if (i.OpCode != OpCodes.Ldstr || (i.Operand as string) != "_Brightness") continue;
+            var c = i.Next;
+            while (c != null)
+            {
+                if ((c.OpCode == OpCodes.Callvirt || c.OpCode == OpCodes.Call)
+                    && c.Operand is MethodReference mr
+                    && mr.Name == "SetFloat"
+                    && mr.DeclaringType.Name == "Material")
+                {
+                    brightnessSetFloat = c;
+                    break;
+                }
+                c = c.Next;
+            }
+            if (brightnessSetFloat != null) break;
+        }
+        if (brightnessSetFloat is null)
+            throw new Exception("Material::SetFloat(\"_Brightness\", ...) call not found in Update");
+
+        var fbField = new FieldDefinition(fieldName,
+            FieldAttributes.Private | FieldAttributes.Static,
+            module.TypeSystem.Single);
+        type.Fields.Add(fbField);
+
+        // At the SetFloat callvirt, stack is [...][material][string][float fB].
+        // dup leaves [...][material][string][float fB][float fB]; stsfld pops
+        // the top into our field, leaving the original 3 args intact for the
+        // SetFloat call to consume. Effectively a non-destructive tee.
+        var il = update.Body.GetILProcessor();
+        var dup = il.Create(OpCodes.Dup);
+        var stfb = il.Create(OpCodes.Stsfld, fbField);
+        il.InsertBefore(brightnessSetFloat, dup);
+        il.InsertAfter(dup, stfb);
+
+        update.Body.MaxStackSize += 1;
+
+        return new(true,
+            $"PipboyPostEffect::Update _Brightness SetFloat tee'd into static "
+          + $"{fieldName} at IL_{brightnessSetFloat.Offset:X4} (no JNI, no work)");
+    }
 }
 
 static class LEDStickBridge
