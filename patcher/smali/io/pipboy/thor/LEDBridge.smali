@@ -258,15 +258,22 @@
     const-string v3, "PIPBOY"
     invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;
 
-    # color = 0xFF00FF00 (Pip-Boy green default).
-    # The screen tint (p0/p1/p2) is intentionally ignored for now: at app
-    # start / in menus it is blue/white, not the Pip-Boy colour. Tracking the
-    # real in-game HUD EffectColor is a TODO via HUDColorBridge once the game
-    # is connected. Until then the sticks default to Pip-Boy green.
+    # color = 0xFF000000 | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+    # r/g/b (p0/p1/p2) are the live screen tint the patched
+    # PipboyPostEffect.SetColor hook just applied to the visible Pip-Boy
+    # (apply()'s arguments). Forward it verbatim so Bifrost's PIPBOY effect
+    # tracks the on-screen HUD colour instead of a frozen green — the sticks
+    # follow whatever colour the player has set. Bifrost's greenIfUnset still
+    # guards genuinely-unset (near-black boot/transition) frames.
     const/high16 v5, -0x1000000      # 0xFF000000 alpha
-    const/16 v6, 0xff
-    shl-int/lit8 v6, v6, 0x8         # 0x0000FF00
-    or-int v5, v5, v6                # 0xFF00FF00
+    and-int/lit16 v6, p0, 0xff
+    shl-int/lit8 v6, v6, 0x10        # (r & 0xFF) << 16
+    or-int v5, v5, v6
+    and-int/lit16 v6, p1, 0xff
+    shl-int/lit8 v6, v6, 0x8         # (g & 0xFF) << 8
+    or-int v5, v5, v6
+    and-int/lit16 v6, p2, 0xff       # | (b & 0xFF)
+    or-int v5, v5, v6
     const-string v2, "color"
     invoke-virtual {v1, v2, v5}, Landroid/content/Intent;->putExtra(Ljava/lang/String;I)Landroid/content/Intent;
     const-string v2, "colorRight"

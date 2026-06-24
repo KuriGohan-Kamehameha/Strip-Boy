@@ -2155,6 +2155,21 @@ static class LEDStickBridge
         if (colorR is null || colorG is null || colorB is null)
             throw new Exception("Color.r/g/b FieldRefs not harvested from module");
 
+        // SetColor's argument is the POST-substitution screen tint: CompanionFlashMenu
+        // hands PipboyPostEffect.SetColor(Color.red) whenever a DebugTools assert has
+        // fired (DebugTools.NeverAsserted == false — routine under GameNative/Box64) and
+        // on boot/transition ramps, NOT the Pip-Boy colour. Source the colour from
+        // AppSettings.PipboyEffectColor instead — the persisted in-game HUD colour the
+        // player actually set (default green 0.212,0.961,0.361, updated from the F4
+        // EffectColor protocol). SetColor stays the *trigger* (it fires whenever the
+        // tint changes, so HUD-colour changes still relay promptly), but the colour we
+        // forward is the real HUD colour, never the red error/boot tint.
+        var appSettingsType = module.GetType("AppSettings")
+            ?? throw new Exception("AppSettings type not found");
+        var hudColorGetter = appSettingsType.Methods.FirstOrDefault(m => m.Name == "get_PipboyEffectColor")
+            ?? throw new Exception("AppSettings::get_PipboyEffectColor not found");
+        var colorType = method.Parameters[0].ParameterType; // UnityEngine.Color
+
         // ---- Cached AndroidJavaClass static field on PipboyPostEffect
         const string cachedFieldName = "_stripboyLedBridgeCls";
         var cachedField = type.Fields.FirstOrDefault(f => f.Name == cachedFieldName);
@@ -2188,12 +2203,15 @@ static class LEDStickBridge
         var finalRet = body.Instructions.LastOrDefault(i => i.OpCode == OpCodes.Ret)
             ?? throw new Exception("PipboyPostEffect::SetColor has no ret");
 
-        // Helper: push (int)(color.<channel> * 255f).
-        // color is arg 1 (instance method, ldarg.0 = this). ldarga.s
-        // for the struct's address so ldfld can read it.
+        // Local holding AppSettings.PipboyEffectColor for this relay.
+        var hudColorLocal = new VariableDefinition(colorType);
+        body.Variables.Add(hudColorLocal);
+
+        // Helper: push (int)(hudColor.<channel> * 255f). hudColor is the local set
+        // from AppSettings.PipboyEffectColor below; ldloca for the struct's address.
         Instruction[] PushChannel(FieldReference channel) => new[]
         {
-            il.Create(OpCodes.Ldarga_S, method.Parameters[0]),
+            il.Create(OpCodes.Ldloca_S, hudColorLocal),
             il.Create(OpCodes.Ldfld, channel),
             il.Create(OpCodes.Ldc_R4, 255f),
             il.Create(OpCodes.Mul),
@@ -2204,6 +2222,9 @@ static class LEDStickBridge
 
         var seq = new List<Instruction>
         {
+            // hudColor = AppSettings.PipboyEffectColor;  (the real HUD colour)
+            il.Create(OpCodes.Call, hudColorGetter),
+            il.Create(OpCodes.Stloc, hudColorLocal),
             // if (_stripboyLedBridgeCls == null) {
             il.Create(OpCodes.Ldsfld, cachedField),
             il.Create(OpCodes.Brtrue, cachedLoad),
@@ -2263,8 +2284,8 @@ static class LEDStickBridge
         if (body.MaxStackSize < 8) body.MaxStackSize = 8;
 
         return new(true,
-            $"PipboyPostEffect::SetColor now relays (r,g,b,1.0f) to "
-          + $"{BridgeClassFqn}.apply (event-driven; no per-frame flicker sync)");
+            $"PipboyPostEffect::SetColor now relays AppSettings.PipboyEffectColor (the real "
+          + $"HUD colour, not the assert/boot red tint) + fTime to {BridgeClassFqn}.apply");
     }
 }
 
