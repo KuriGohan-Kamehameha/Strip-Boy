@@ -1306,12 +1306,28 @@ static class AutoPickLoopback
                 return new(false, "IPListMenu::SetPossibleConnections already auto-picks loopback");
         }
 
-        // We need two local ints: idx and a slot for the current device.
-        // For simplicity use just one int local (idx) and re-fetch the device
-        // each iteration via _possibleConnections[idx].
+        var remoteType = module.GetType("RemoteDeviceDescription")
+            ?? throw new Exception("RemoteDeviceDescription type not found");
+        var remoteCtor = remoteType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0)
+            ?? throw new Exception("RemoteDeviceDescription::.ctor not found");
+        var ipBacking = remoteType.Fields.FirstOrDefault(f => f.Name.Contains("<IP>") && f.Name.Contains("BackingField"))
+            ?? throw new Exception("RemoteDeviceDescription IP backing field not found");
+        var platformBacking = remoteType.Fields.FirstOrDefault(f => f.Name.Contains("<Platform>") && f.Name.Contains("BackingField"))
+            ?? throw new Exception("RemoteDeviceDescription Platform backing field not found");
+        var busyBacking = remoteType.Fields.FirstOrDefault(f => f.Name.Contains("<IsBusy>") && f.Name.Contains("BackingField"))
+            ?? throw new Exception("RemoteDeviceDescription IsBusy backing field not found");
+        var authBacking = remoteType.Fields.FirstOrDefault(f => f.Name.Contains("<RequiresAuthentication>") && f.Name.Contains("BackingField"))
+            ?? throw new Exception("RemoteDeviceDescription RequiresAuthentication backing field not found");
+        var addMethod = new MethodReference("Add", module.TypeSystem.Void, possibleConnectionsField.FieldType) { HasThis = true };
+        addMethod.Parameters.Add(new ParameterDefinition(elementType));
+
+        // We need one int local (idx) and one RemoteDeviceDescription local
+        // for synthetic loopback when discovery returns empty.
         var int32Type = module.TypeSystem.Int32;
         var idxLocal = new VariableDefinition(int32Type);
+        var syntheticLocal = new VariableDefinition(elementType);
         body.Variables.Add(idxLocal);
+        body.Variables.Add(syntheticLocal);
 
         var il = body.GetILProcessor();
 
@@ -1345,6 +1361,33 @@ static class AutoPickLoopback
 
         var doneAnchor = oldRet;  // jump here to exit
         var initIdx0 = il.Create(OpCodes.Ldc_I4_0);
+
+        // If discovery returned no devices, synthesize PC 127.0.0.1 before the
+        // normal loop. This bypasses the game's UDP autodiscover race and lets
+        // SocketNetworkChannel's retrying TCP connect wait for port 27000.
+        var skipSynthetic0 = il.Create(OpCodes.Ldarg_0);
+        var loadCountForSynthetic0 = il.Create(OpCodes.Ldarg_0);
+        var loadCountForSynthetic1 = il.Create(OpCodes.Ldfld, possibleConnectionsField);
+        var loadCountForSynthetic2 = il.Create(OpCodes.Callvirt, getCount);
+        var branchHaveItems = il.Create(OpCodes.Brtrue, initIdx0);
+        var newSynthetic = il.Create(OpCodes.Newobj, remoteCtor);
+        var storeSynthetic = il.Create(OpCodes.Stloc, syntheticLocal);
+        var setIp0 = il.Create(OpCodes.Ldloc, syntheticLocal);
+        var setIp1 = il.Create(OpCodes.Ldstr, "127.0.0.1");
+        var setIp2 = il.Create(OpCodes.Stfld, ipBacking);
+        var setPlatform0 = il.Create(OpCodes.Ldloc, syntheticLocal);
+        var setPlatform1 = il.Create(OpCodes.Ldc_I4_0);
+        var setPlatform2 = il.Create(OpCodes.Stfld, platformBacking);
+        var setBusy0 = il.Create(OpCodes.Ldloc, syntheticLocal);
+        var setBusy1 = il.Create(OpCodes.Ldc_I4_0);
+        var setBusy2 = il.Create(OpCodes.Stfld, busyBacking);
+        var setAuth0 = il.Create(OpCodes.Ldloc, syntheticLocal);
+        var setAuth1 = il.Create(OpCodes.Ldc_I4_0);
+        var setAuth2 = il.Create(OpCodes.Stfld, authBacking);
+        var addSynthetic0 = il.Create(OpCodes.Ldarg_0);
+        var addSynthetic1 = il.Create(OpCodes.Ldfld, possibleConnectionsField);
+        var addSynthetic2 = il.Create(OpCodes.Ldloc, syntheticLocal);
+        var addSynthetic3 = il.Create(OpCodes.Callvirt, addMethod);
         var initIdx1 = il.Create(OpCodes.Stloc, idxLocal);
 
         var loopHead = il.Create(OpCodes.Ldloc, idxLocal);
@@ -1381,6 +1424,13 @@ static class AutoPickLoopback
         // Now wire them up in order, inserting before the existing ret.
         var sequence = new[]
         {
+            skipSynthetic0, loadCountForSynthetic0, loadCountForSynthetic1, loadCountForSynthetic2, branchHaveItems,
+            newSynthetic, storeSynthetic,
+            setIp0, setIp1, setIp2,
+            setPlatform0, setPlatform1, setPlatform2,
+            setBusy0, setBusy1, setBusy2,
+            setAuth0, setAuth1, setAuth2,
+            addSynthetic0, addSynthetic1, addSynthetic2, addSynthetic3,
             initIdx0, initIdx1,
             loopHead,
             loadCount0, loadCount1, loadCount2, bgeDone,
