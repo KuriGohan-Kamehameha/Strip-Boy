@@ -1,8 +1,13 @@
 # Thor launcher — companion auto-patch
 
-Status: **in progress.** Detection + orchestration skeleton landed; the
-on-device patch engine is unresolved and needs a decision (see
-[The one open decision](#the-one-open-decision)).
+Status: **Option A implemented (DRAFT).** Detection + orchestration landed; the
+on-device patch engine (`NativePatchEngine`) now runs all six stages. Stage 2
+(arm64 Cecil binary) is bundled and device-gated; stages 3-5 (smali inject,
+binary-AXML manifest edit, repackage + sign) are implemented in pure JVM and
+validated off-device against the `scripts/build.sh` reference — see
+[On-device pipeline — status](#on-device-pipeline--status) and
+[Verification status](#verification-status). Final install + launch on the AYN
+Thor is the remaining corporeality-gated step.
 
 ## Goal
 
@@ -173,27 +178,86 @@ Output: an `ELF aarch64` `pipboy-patcher`. It ships in the wrapper at
 |-------|-----------|--------|
 | 1. Extract `Assembly-CSharp.dll` | `java.util.zip` from the companion APK | **done** |
 | 2. IL patch | exec bundled `libpipboy-patcher.so` via `ProcessBuilder` | **done + binary bundled** (packaged in APK; on-device exec is device-gated) |
-| 3. smali helper inject | dexlib2 + a prebuilt helper `.dex` from `patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear}.smali` (Kuri's own code, no Bethesda bytes) merged into the companion `classes.dex` | **pending** (new dep) |
-| 4. manifest intent-filter move | pure-Java AXML edit (desktop equivalent: `scripts/patch_manifest.py`, but that runs on apktool-decoded text; on-device must edit binary AXML) | **pending** (new dep) |
-| 5. repackage + zipalign + sign | rebuild the zip, then `apksig` | **pending** (new dep) |
-
-Stages 3-5 are standard binary-APK manipulation, but they produce an APK that
-must install and run on the Thor — building them without an on-device iterate
-loop risks a silently-broken APK. They are best landed with the device in hand;
-each can be structurally checked off-device (`apksigner verify`, dex validation,
-AXML re-parse) but final install+launch is corporeality-gated.
+| 3. smali helper inject | a prebuilt helper `.dex` (assembled from `patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear}.smali` — Kuri's own code, no Bethesda bytes — by the `buildHelperDex` gradle task), shipped as `app/src/main/assets/helper.dex`, injected on-device as the next free `classesN.dex` (NOT merged into `classes.dex`; ART API 33 loads all `classesN.dex`) | **done** (DRAFT, off-device validated) |
+| 4. manifest intent-filter move | pure-Java binary-AXML edit via ARSCLib (`io.github.reandroid:ARSCLib`); resolves `@string/app_name` against `resources.arsc` and writes `@android:style/Theme.NoDisplay` = `0x01030055`. Same edits as `scripts/patch_manifest.py` | **done** (DRAFT, off-device validated) |
+| 5. repackage + zipalign + sign | rebuild the zip (patched DLL + edited manifest + injected dex, stale `META-INF` signatures dropped, `STORED` entries preserved for alignment), then sign + align with `com.android.tools.build:apksig` (`setAlignFileSize(true)`) using a key in app storage | **done** (DRAFT, off-device validated) |
 | 6. install | `PackageInstaller` / `ACTION_VIEW` (already wired in `CompanionPatcher`) | **done** |
 
-Until stages 3-5 land, `NativePatchEngine.patch()` runs the real on-device IL
-patch and then returns `Unsupported("IL stage complete … remaining stages not
-wired")` — it never emits a half-built APK, and the wizard falls back to the
-PC-build message. New dependencies to add for 3-5: `com.android.tools.smali:smali-dexlib2`
-and `com.android.tools.build:apksig`, plus a build step that compiles the two
-helper classes to the prebuilt `.dex` asset.
+`NativePatchEngine.patch()` now runs all six stages and returns
+`PatchOutcome.Success(<signed apk>)` when they pass. Stages 3-5 are implemented
+in `PatchAssembler.kt` — a pure-JVM (no Android-framework types) object so the
+SAME code runs on-device and in the off-device validation harness. The engine
+never emits a half-built APK: any stage failure returns `PatchOutcome.Failed`
+with a clear reason and the wizard falls back to the PC-build message.
+
+The on-device signing key is an `AndroidKeyStore` RSA key generated on first use
+(alias `thorlaunch-companion-signer`, SHA-1/256/512 digests so the original
+companion's `minSdk 14` v1 JAR signature is valid). It is hardware/OS-backed,
+non-exportable, and only ever re-signs the user's own APK — clean-room intact.
+
+### helper.dex prebuild command
+
+The gradle task `:app:buildHelperDex` assembles the three smali sources into
+`helper.dex` (wired into the asset merger as `assets/helper.dex`):
+
+```
+./gradlew :app:buildHelperDex
+# underlying invocation (smali fork on Google's maven, build-time only):
+#   java -cp <com.android.tools.smali:smali:3.0.9 + deps> \
+#     com.android.tools.smali.smali.Main assemble --api 33 \
+#     --output build/generated/helper-dex/helper.dex \
+#     patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear}.smali
+```
+
+smali runs only at build time (the `smaliTool` configuration) — it never ships
+inside the APK. The runtime deps that DO ship are ARSCLib + apksig.
+
+## New dependencies
+
+`thor-launch-wrapper/gradle/libs.versions.toml`:
+
+- `io.github.reandroid:ARSCLib:1.3.8` — `implementation` (stage 4).
+- `com.android.tools.build:apksig:8.7.3` — `implementation` (stage 5).
+- `com.android.tools.smali:smali:3.0.9` — `smaliTool` (build-time only, stage-3 dex).
 
 ## Verification status
 
-- Compiles: `assembleDebug` BUILD SUCCESSFUL (Kotlin + merged manifest/resources).
-- On-device behavior (acquire / verify / install prompt): **corporeality-gated**
-  — needs the AYN Thor + a user-supplied original APK; not verified on the build
-  host.
+Stages 3-5 are pure JVM and were validated OFF-DEVICE against the known-good
+`scripts/build.sh` reference (`apk/out/pipboy-loopback.apk`). Run the driver:
+
+```
+./scripts/verify_ondevice_stages.sh
+```
+
+It runs the desktop Cecil patcher (stage-2 stand-in), the `buildHelperDex`
+task (stage-3 asset), then exercises the SAME `PatchAssembler` code via the
+`:app:testDebugUnitTest` harness (`PatchAssemblerHarnessTest`), and asserts:
+
+- `apksigner verify` → **PASS** (v1 + v2 + v3 schemes all verified).
+- `aapt2 dump xmltree` vs the reference → **identical** on `LauncherActivity`
+  (NoDisplay/exported/noHistory/excludeFromRecents + MAIN/LAUNCHER/LEANBACK
+  filter), the stripped Unity launcher filter, the `CONTROL_LEDS` permission,
+  and the `<queries><package name="com.moonbench.bifrost"/>` block.
+- `dexdump` across the dex set → `Lio/pipboy/thor/{LauncherActivity,LEDBridge,
+  LEDClear};` present (in the injected `classes2.dex`).
+- `sha256` of in-APK `Assembly-CSharp.dll` == the stage-2 patched DLL.
+
+Idempotence is asserted too: re-patching an already-patched APK yields exactly
+one `LauncherActivity` and re-verifies.
+
+- Compiles + packages: `./gradlew :app:assembleDebug` BUILD SUCCESSFUL — the
+  wrapper APK contains `assets/helper.dex`, `lib/arm64-v8a/libpipboy-patcher.so`,
+  and the ARSCLib/apksig + `PatchAssembler` classes in its dex set.
+
+### Genuine device-gated remainder
+
+Everything structurally checkable is green off-device. What CANNOT be verified
+on the Mac build host (corporeality-gated, needs the AYN Thor):
+
+- The stage-2 arm64 native patcher exec'ing on-device (validated here via the
+  desktop Cecil patcher producing a byte-identical DLL, but the `linux-bionic-arm64`
+  binary itself only runs on the device).
+- AndroidKeyStore key generation + signing (the JVM harness uses the file-based
+  `apk/debug.keystore`; the on-device path uses `AndroidKeyStore`, exercised only
+  on a real device).
+- Final `PackageInstaller` install + launch of the produced APK on the Thor.

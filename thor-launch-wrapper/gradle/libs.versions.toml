@@ -10,9 +10,18 @@ material = "1.10.0"
 activity = "1.8.0"
 constraintlayout = "2.1.4"
 material3 = "1.4.0"
+arsclib = "1.3.8"
+apksig = "8.7.3"
+smali = "3.0.9"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+# Binary AXML/ARSC editor — stage-4 manifest edit with resource-reference resolution.
+arsclib = { group = "io.github.reandroid", name = "ARSCLib", version.ref = "arsclib" }
+# APK v1/v2/v3 signer + aligner — stage-5 sign + zipalign.
+apksig = { group = "com.android.tools.build", name = "apksig", version.ref = "apksig" }
+# smali assembler — build-time only (helperDex task); not bundled in the APK.
+smali = { group = "com.android.tools.smali", name = "smali", version.ref = "smali" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }

@@ -852,9 +852,10 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * When the companion is installed but unpatched, attempt the patch once per
-     * detection cycle. The current [companionPatchEngine] has no on-device IL
-     * toolchain, so this degrades to a clear "patch on PC" message rather than
-     * faking success; it is the seam where a real engine drops in.
+     * detection cycle. [companionPatchEngine] is [NativePatchEngine], which runs
+     * the full on-device pipeline (IL patch + smali inject + manifest edit +
+     * sign). On any failure it returns [PatchOutcome.Failed]/[PatchOutcome.Unsupported]
+     * with a clear reason rather than faking success or emitting a broken APK.
      */
     private fun maybeAutoPatchCompanion(state: WizardState) {
         if (state.companionState != CompanionState.UNPATCHED) {
