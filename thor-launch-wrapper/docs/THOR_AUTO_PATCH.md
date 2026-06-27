@@ -281,6 +281,15 @@ failed with `Failed to resolve assembly: 'mscorlib, Version=2.0.5.0...'` (exit 1
 Fix: `NativePatchEngine` extracts the entire `assets/bin/Data/Managed/` dir next
 to the input DLL so the resolver finds the siblings.
 
+**Bug found only at RUNTIME (install + manifest-resolve masked it):** `helper.dex`
+was assembled with `--api 33`, which smali emitted as **dex version 040**
+(Android 14 / API 34). ART on the API-33 Thor refuses to load a 040 dex, so the
+`io.pipboy.thor.*` helper classes failed at runtime — even though install
+succeeded and `MAIN` still resolved to `LauncherActivity` (that comes from the
+manifest, not the dex). Fix: assemble with `--api 23` → baseline **dex 035**,
+which loads everywhere. Lesson: device-confirmation must include a real
+*launch + exercise*, not just install + `resolve-activity`.
+
 Also corrected: the `CHECKSUMS.md` baseline size (and `CompanionPatcher.BASELINE_SIZE_BYTES`)
 were 39 591 950 but the real baseline is 39 585 934 bytes — the sha256 was right,
 only the size was wrong.

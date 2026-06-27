@@ -98,7 +98,11 @@ abstract class BuildHelperDexTask : JavaExec() {
         mainClass.set("com.android.tools.smali.smali.Main")
         args = buildList {
             add("assemble")
-            add("--api"); add("33")
+            // --api 23 (the companion's targetSdk) emits the baseline dex 035.
+            // Higher values made smali emit dex 040 (Android 14 / API 34), which
+            // ART on the API-33 Thor refuses to load → the io.pipboy.thor.* helper
+            // classes fail at runtime even though install/manifest resolve fine.
+            add("--api"); add("23")
             add("--output"); add(outDex.absolutePath)
             sources.forEach { add(it.absolutePath) }
         }
