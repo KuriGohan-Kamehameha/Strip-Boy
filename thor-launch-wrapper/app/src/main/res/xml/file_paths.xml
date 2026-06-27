@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Patched companion APKs are staged under cacheDir/companion-patch and
+         handed to the system installer via FileProvider. -->
+    <cache-path
+        name="companion-patch"
+        path="companion-patch/" />
+</paths>

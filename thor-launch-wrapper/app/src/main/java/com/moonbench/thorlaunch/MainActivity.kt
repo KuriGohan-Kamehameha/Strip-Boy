@@ -4,7 +4,6 @@ import android.app.ActivityManager
 import android.app.ActivityOptions
 import android.app.Presentation
 import android.content.BroadcastReceiver
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -37,6 +36,7 @@ import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
@@ -63,6 +63,10 @@ class MainActivity : AppCompatActivity() {
     private var bifrostPluginInstalled = false
     private var bifrostPluginDetail = "query pending"
     private var bifrostPluginQueryInFlight = false
+    private val companionPatchEngine: PatchEngine = NativePatchEngine()
+    private var companionPatchInFlight = false
+    private var companionPatchAttempted = false
+    private var companionPatchDetail = ""
     private var bootSequenceGeneration = 0
     private var bootControlsReady = false
     private var pendingAutoLaunch = false
@@ -70,6 +74,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         headlessAutoMode = prefs.getBoolean(KEY_SKIP_WIZARD, false)
+        companionPatchDetail = getString(R.string.companion_unpatched_detail)
 
         val screen = FrameLayout(this).apply {
             setBackgroundColor(COLOR_BLACK_GREEN)
@@ -149,7 +154,10 @@ class MainActivity : AppCompatActivity() {
         refreshButton = Button(this).apply {
             text = getString(R.string.refresh_button)
             styleButton(this, compact = true)
-            setOnClickListener { refreshWizardState() }
+            setOnClickListener {
+                companionPatchAttempted = false
+                refreshWizardState()
+            }
         }
 
         checkingView = TextView(this).apply {
@@ -426,6 +434,7 @@ class MainActivity : AppCompatActivity() {
         updateActionPanel(state)
         bottomPresentation?.updateState(state)
         queryBifrostPlugin(state.bifrostInstalled)
+        maybeAutoPatchCompanion(state)
         if (endpointFields[KEY_GAMENATIVE_ACTIVITY]?.text?.isNullOrBlank() == true && state.gameNativeActivityName.isNotBlank()) {
             endpointFields[KEY_GAMENATIVE_ACTIVITY]?.setText(state.gameNativeActivityName)
         }
@@ -443,7 +452,16 @@ class MainActivity : AppCompatActivity() {
             .ifBlank { DEFAULT_BIFROST_PACKAGE }
 
         val gameNativeInstalled = isPackageInstalled(gameNativePackage)
-        val companionInstalled = isPatchedCompanionInstalled(companionPackage)
+        val companionState = CompanionPatcher.detect(
+            packageManager,
+            companionPackage,
+            COMPANION_LAUNCHER_ACTIVITY
+        )
+        val companionInstalled = companionState == CompanionState.PATCHED
+        val companionDetail = when (companionState) {
+            CompanionState.UNPATCHED -> companionPatchDetail
+            else -> companionPackage
+        }
         val bifrostInstalled = isPackageInstalled(bifrostPackage)
         val pipBoyPluginInstalled = bifrostInstalled && bifrostPluginInstalled
         val bottomDisplayAvailable = findBottomDisplayId() != null
@@ -452,6 +470,8 @@ class MainActivity : AppCompatActivity() {
 
         val fullyReady = gameNativeInstalled && companionInstalled && shortcutReady && bottomDisplayAvailable && bifrostInstalled && pipBoyPluginInstalled
         val blockingMessage = when {
+            companionState == CompanionState.UNPATCHED ->
+                getString(R.string.block_companion_unpatched, companionPackage)
             !companionInstalled -> getString(R.string.block_companion_missing, companionPackage)
             !gameNativeInstalled -> getString(R.string.block_gamenative_missing, gameNativePackage)
             !shortcutReady -> getString(R.string.block_shortcut_missing, gameNativePackage)
@@ -478,6 +498,8 @@ class MainActivity : AppCompatActivity() {
             shortcutFound = shortcutReady,
             shortcutLabel = resolvedGameNativeActivity,
             companionInstalled = companionInstalled,
+            companionState = companionState,
+            companionDetail = companionDetail,
             bottomDisplayAvailable = bottomDisplayAvailable,
             bifrostInstalled = bifrostInstalled,
             bifrostPluginInstalled = pipBoyPluginInstalled,
@@ -580,7 +602,7 @@ class MainActivity : AppCompatActivity() {
         val rows = listOf(
             StatusRow(getString(R.string.check_gamenative_installed), state.gameNativeInstalled, state.gameNativePackage),
             StatusRow(getString(R.string.check_gamenative_shortcut_found), state.shortcutFound, state.shortcutLabel.ifBlank { getString(R.string.shortcut_manual_instructions) }),
-            StatusRow(getString(R.string.check_companion_installed), state.companionInstalled, state.companionPackage),
+            StatusRow(getString(R.string.check_companion_installed), state.companionInstalled, state.companionDetail),
             StatusRow(getString(R.string.check_bottom_display_available), state.bottomDisplayAvailable, getString(R.string.bottom_display_detail)),
             StatusRow(getString(R.string.check_bifrost_app_installed), state.bifrostInstalled, state.bifrostPackage),
             StatusRow(getString(R.string.check_bifrost_plugin_installed), state.bifrostPluginInstalled, state.bifrostPluginDetail)
@@ -828,13 +850,64 @@ class MainActivity : AppCompatActivity() {
         true
     }.getOrDefault(false)
 
-    private fun isPatchedCompanionInstalled(packageName: String): Boolean = runCatching {
-        packageManager.getActivityInfo(
-            ComponentName(packageName, COMPANION_LAUNCHER_ACTIVITY),
-            0
-        )
-        true
-    }.getOrDefault(false)
+    /**
+     * When the companion is installed but unpatched, attempt the patch once per
+     * detection cycle. The current [companionPatchEngine] has no on-device IL
+     * toolchain, so this degrades to a clear "patch on PC" message rather than
+     * faking success; it is the seam where a real engine drops in.
+     */
+    private fun maybeAutoPatchCompanion(state: WizardState) {
+        if (state.companionState != CompanionState.UNPATCHED) {
+            companionPatchAttempted = false
+            return
+        }
+        if (companionPatchInFlight || companionPatchAttempted) {
+            return
+        }
+        companionPatchAttempted = true
+        companionPatchInFlight = true
+        companionPatchDetail = getString(R.string.companion_patch_in_progress)
+        statusView.text = getString(R.string.status_patching_companion)
+        val companionPackage = state.companionPackage
+        Thread({ runCompanionPatch(companionPackage) }, "thorlaunch-companion-patch").start()
+    }
+
+    private fun runCompanionPatch(companionPackage: String) {
+        val apk = CompanionPatcher.locateInstalledApk(packageManager, companionPackage)
+        val outcome: PatchOutcome = if (apk == null) {
+            PatchOutcome.Failed(getString(R.string.patch_locate_failed))
+        } else {
+            val baseline = CompanionPatcher.verifyBaseline(apk)
+            Log.i(
+                TAG,
+                "companion baseline match=${baseline.matches} " +
+                    "sha=${baseline.sha256} size=${baseline.sizeBytes}"
+            )
+            val workDir = File(cacheDir, COMPANION_PATCH_DIR).apply { mkdirs() }
+            companionPatchEngine.patch(this, apk, workDir)
+        }
+        handler.post { onCompanionPatchResult(outcome) }
+    }
+
+    private fun onCompanionPatchResult(outcome: PatchOutcome) {
+        companionPatchInFlight = false
+        companionPatchDetail = when (outcome) {
+            is PatchOutcome.Success -> getString(R.string.patch_success_detail)
+            is PatchOutcome.Unsupported -> outcome.reason
+            is PatchOutcome.Failed -> outcome.reason
+        }
+        if (outcome is PatchOutcome.Success) {
+            val installed = CompanionPatcher.installPatchedApk(this, outcome.patchedApk)
+            if (!installed) {
+                companionPatchDetail = getString(R.string.patch_install_failed)
+            }
+        }
+        val state = collectState()
+        statusView.text = state.blockingMessage
+        renderInfoTable(state, animate = false)
+        updateActionPanel(state)
+        bottomPresentation?.updateState(state)
+    }
 
     private fun queryBifrostPlugin(bifrostInstalled: Boolean) {
         if (!bifrostInstalled) {
@@ -894,6 +967,7 @@ class MainActivity : AppCompatActivity() {
         const val DEFAULT_GAME_SOURCE = "GOG"
         const val DEFAULT_COMPANION_PACKAGE = "com.bethsoft.falloutcompanionapp"
         const val COMPANION_LAUNCHER_ACTIVITY = "io.pipboy.thor.LauncherActivity"
+        const val COMPANION_PATCH_DIR = "companion-patch"
         const val DEFAULT_BIFROST_PACKAGE = "com.moonbench.bifrost"
         const val BIFROST_RECEIVER_CLASS = "com.moonbench.bifrost.external.ExternalApiReceiver"
         const val BIFROST_PERMISSION = "com.moonbench.bifrost.permission.CONTROL_LEDS"
@@ -958,6 +1032,8 @@ class MainActivity : AppCompatActivity() {
         val shortcutFound: Boolean,
         val shortcutLabel: String,
         val companionInstalled: Boolean,
+        val companionState: CompanionState,
+        val companionDetail: String,
         val bottomDisplayAvailable: Boolean,
         val bifrostInstalled: Boolean,
         val bifrostPluginInstalled: Boolean,

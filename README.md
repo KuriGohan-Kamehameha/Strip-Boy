@@ -142,6 +142,15 @@ drawing the wizard, showing itself again only if a prerequisite fails. Manual
 launches with that box unchecked prime both Thor stick LEDs to green at roughly
 30% brightness before handoff.
 
+The wrapper distinguishes three companion states — not installed, installed but
+**unpatched**, and patched — and on detecting an unpatched companion it begins
+the patch flow (locate the installed `base.apk`, verify it against the known
+v1.2 baseline, then patch + install). The on-device patch *engine* is still
+open: see [`thor-launch-wrapper/docs/THOR_AUTO_PATCH.md`](thor-launch-wrapper/docs/THOR_AUTO_PATCH.md)
+for what is implemented and the one engine decision that remains. Until an
+on-device engine lands, an unpatched companion degrades to a clear
+"build it on PC with `scripts/build.sh`" message rather than a silent failure.
+
 ## In-game setup
 
 Inside the Wine prefix that runs Fallout 4, edit

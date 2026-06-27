@@ -29,6 +29,13 @@
     <string name="status_missing_package">Missing package: %1$s</string>
     <string name="status_missing_gamenative_shortcut">GameNative launch failed for the Fallout 4 GOG target.</string>
     <string name="block_companion_missing">Patched Pip-Boy companion not found: %1$s</string>
+    <string name="block_companion_unpatched">Pip-Boy companion installed but not patched: %1$s</string>
+    <string name="companion_unpatched_detail">unpatched — auto-patch pending</string>
+    <string name="companion_patch_in_progress">unpatched — patching…</string>
+    <string name="status_patching_companion">Unpatched Pip-Boy found. Attempting on-device patch…</string>
+    <string name="patch_locate_failed">Could not read the installed Pip-Boy APK to patch it.</string>
+    <string name="patch_success_detail">Patched APK built — confirm the install prompt.</string>
+    <string name="patch_install_failed">Patched APK built but the installer could not start. Enable "install unknown apps" for this launcher.</string>
     <string name="block_gamenative_missing">GameNative not found: %1$s</string>
     <string name="block_shortcut_missing">GameNative Fallout 4 GOG target not set for %1$s</string>
     <string name="block_bottom_display_missing">Thor bottom display not detected</string>
