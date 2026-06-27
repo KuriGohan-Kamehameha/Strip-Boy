@@ -80,7 +80,7 @@ object CompanionPatcher {
     /** Known-good Bethesda Pip-Boy v1.2 baseline (see `docs/CHECKSUMS.md`). */
     const val BASELINE_SHA256 =
         "974b8833af43def6640a4490a51f809cf1488244ca885df4c1f5632a145a91ce"
-    const val BASELINE_SIZE_BYTES = 39_591_950L
+    const val BASELINE_SIZE_BYTES = 39_585_934L
 
     private const val SHA_BUFFER_BYTES = 1 shl 16            // 64 KiB read window
     private const val MAX_SHA_CHUNKS = 8192                  // bound the hash loop (≤512 MiB)

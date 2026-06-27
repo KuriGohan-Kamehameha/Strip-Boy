@@ -261,3 +261,26 @@ on the Mac build host (corporeality-gated, needs the AYN Thor):
   `apk/debug.keystore`; the on-device path uses `AndroidKeyStore`, exercised only
   on a real device).
 - Final `PackageInstaller` install + launch of the produced APK on the Thor.
+
+## Device-confirmed (2026-06-27, AYN Thor, Android 13 / API 33)
+
+The above device-gated remainder is now CONFIRMED. The wrapper ran the full
+pipeline on the Thor against an unpatched companion:
+
+- `native patcher exit=0` — all 16 IL patches applied on the arm64 binary.
+- Produced `pipboy-patched.apk` (~41 MB); `apksigner verify` PASS (v1+v2+v3,
+  signed by the on-device `AndroidKeyStore` key); marker
+  `io.pipboy.thor.LauncherActivity` present; 3 helper classes in `classes2.dex`.
+  Installed — `MAIN` resolves to the patch marker.
+
+**Bug found only on-device (harness/desktop masked it):** the Cecil patcher must
+resolve `Assembly-CSharp.dll`'s sibling assemblies (mscorlib, System,
+UnityEngine). The desktop/harness resolved `mscorlib` from the host .NET install;
+the self-contained Android binary has no host runtime, so `AutoPickFullscreenMode`
+failed with `Failed to resolve assembly: 'mscorlib, Version=2.0.5.0...'` (exit 1).
+Fix: `NativePatchEngine` extracts the entire `assets/bin/Data/Managed/` dir next
+to the input DLL so the resolver finds the siblings.
+
+Also corrected: the `CHECKSUMS.md` baseline size (and `CompanionPatcher.BASELINE_SIZE_BYTES`)
+were 39 591 950 but the real baseline is 39 585 934 bytes — the sha256 was right,
+only the size was wrong.

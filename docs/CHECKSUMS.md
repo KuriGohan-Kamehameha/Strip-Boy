@@ -15,7 +15,7 @@ work. But this is the known-good baseline.
 | package       | `com.bethsoft.falloutcompanionapp`                               |
 | versionName   | `1.2`                                                            |
 | versionCode   | `9`                                                              |
-| size          | 39 591 950 bytes (≈37.8 MiB)                                      |
+| size          | 39 585 934 bytes (≈37.8 MiB)                                      |
 | sha256        | `974b8833af43def6640a4490a51f809cf1488244ca885df4c1f5632a145a91ce`|
 | released      | 2016-03-22                                                       |
 | platformBuild | Unity `5.x` / `6.0-2438415`                                      |

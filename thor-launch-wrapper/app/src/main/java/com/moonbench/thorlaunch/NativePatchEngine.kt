@@ -38,13 +38,20 @@ class NativePatchEngine : PatchEngine {
                 "Native patcher ($NATIVE_PATCHER_SO) is not in this build's arm64 " +
                     "native libs. Rebuild the wrapper with the bundled binary."
             )
-        val originalDll = File(workDir, "Assembly-CSharp.original.dll")
-        val patchedDll = File(workDir, "Assembly-CSharp.patched.dll")
-        if (!extractEntry(input, MANAGED_DLL_ENTRY, originalDll)) {
+        // Extract the WHOLE Managed/ dir, not just Assembly-CSharp.dll: the Cecil
+        // patcher resolves referenced assemblies (mscorlib, System, UnityEngine…)
+        // from the input DLL's directory. The desktop/harness masked this by
+        // resolving mscorlib from the host .NET install; the self-contained
+        // Android binary has no host runtime, so the siblings must be present or
+        // patches that touch mscorlib types (e.g. AutoPickFullscreenMode) fail.
+        val managedDir = File(workDir, "managed")
+        if (!extractManagedDlls(input, managedDir)) {
             return PatchOutcome.Failed(
-                "Could not extract $MANAGED_DLL_ENTRY from the companion APK."
+                "Could not extract $MANAGED_DIR*.dll from the companion APK."
             )
         }
+        val originalDll = File(managedDir, "Assembly-CSharp.dll")
+        val patchedDll = File(managedDir, "Assembly-CSharp.patched.dll")
         val ilResult = runNativePatcher(binary, originalDll, patchedDll)
         if (ilResult !is PatchOutcome.Success) {
             return ilResult
@@ -175,21 +182,44 @@ class NativePatchEngine : PatchEngine {
         return File(dir, NATIVE_PATCHER_SO).takeIf { it.isFile && it.canExecute() }
     }
 
-    private fun extractEntry(apk: File, entryName: String, dest: File): Boolean = runCatching {
+    /**
+     * Extract every `.dll` under `assets/bin/Data/Managed/` into [destDir] (flat,
+     * by basename) so the Cecil patcher's assembly resolver finds Assembly-CSharp's
+     * sibling references (mscorlib, System, UnityEngine...). Returns true only if
+     * Assembly-CSharp.dll was present and extracted.
+     */
+    private fun extractManagedDlls(apk: File, destDir: File): Boolean = runCatching {
+        destDir.mkdirs()
+        var sawMain = false
         ZipFile(apk).use { zip ->
-            val entry = zip.getEntry(entryName) ?: return false
-            dest.parentFile?.mkdirs()
-            zip.getInputStream(entry).use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
+            val entries = zip.entries()
+            var count = 0
+            while (entries.hasMoreElements() && count < MAX_ZIP_ENTRIES) {
+                count++
+                val entry = entries.nextElement()
+                val name = entry.name
+                if (entry.isDirectory || !name.startsWith(MANAGED_DIR) || !name.endsWith(".dll")) {
+                    continue
+                }
+                val dest = File(destDir, name.substringAfterLast('/'))
+                zip.getInputStream(entry).use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output) }
+                }
+                if (dest.name == MANAGED_DLL_NAME) sawMain = dest.isFile && dest.length() > 0
             }
         }
-        dest.isFile && dest.length() > 0
-    }.getOrDefault(false)
+        sawMain
+    }.getOrElse {
+        Log.w(TAG, "extractManagedDlls failed", it)
+        false
+    }
 
     private companion object {
         const val TAG = "ThorNativePatchEngine"
         const val NATIVE_PATCHER_SO = "libpipboy-patcher.so"
-        const val MANAGED_DLL_ENTRY = "assets/bin/Data/Managed/Assembly-CSharp.dll"
+        const val MANAGED_DIR = "assets/bin/Data/Managed/"
+        const val MANAGED_DLL_NAME = "Assembly-CSharp.dll"
+        const val MAX_ZIP_ENTRIES = 100_000
         const val PATCH_TIMEOUT_SECONDS = 120L
         const val LOG_OUTPUT_CHARS = 400
 
