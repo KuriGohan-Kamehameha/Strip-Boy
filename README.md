@@ -32,6 +32,12 @@ This repository contains **the patcher and build scripts**. You supply
 your own personal copy of the original v1.2 APK; nothing in this repo
 redistributes Bethesda's code or assets.
 
+It also carries a small Android helper app under
+[`thor-launch-wrapper/`](thor-launch-wrapper/) for the AYN Thor flow: one tap
+starts the patched companion on the bottom display, starts GameNative on the
+top display with the verified GOG Fallout 4 target, then removes the launcher
+from the task stack.
+
 ## What's patched
 
 | # | Method                                                       | Change |
@@ -89,6 +95,52 @@ adb install -r apk/out/pipboy-loopback.apk
 ```
 
 Or sideload via the Android Files app from the APK file.
+
+## Thor launch wrapper
+
+The optional wrapper APK is source-only in this repo at
+[`thor-launch-wrapper/`](thor-launch-wrapper/). It is intentionally separate
+from the patched Bethesda companion APK: the wrapper is a small native Android
+app with a green-on-black Pip-Boy-style interface, a custom launcher icon,
+and a strict patched-companion check.
+
+Launch contract:
+
+- Companion package: `com.bethsoft.falloutcompanionapp`
+- Patched companion marker: `io.pipboy.thor.LauncherActivity`
+- GameNative package: `app.gamenative`
+- GameNative action: `app.gamenative.LAUNCH_GAME`
+- Fallout 4 GOG app id: `1998527297`
+- GameNative source extra: `game_source=GOG`
+- Bifrost package: `com.moonbench.bifrost`
+- Required Bifrost plugin id: `fallout4-pipboy`
+
+Build and install:
+
+```bash
+cd thor-launch-wrapper
+JAVA_HOME="$(/usr/libexec/java_home -v 17)" ./gradlew assembleDebug --no-daemon
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+ADB-only smoke launch:
+
+```bash
+adb shell am start -n com.moonbench.thorlaunch/.MainActivity \
+  --ez com.moonbench.thorlaunch.AUTO_LAUNCH true
+```
+
+Expected final state on AYN Thor:
+
+- Display #0: `app.gamenative/.MainActivity`
+- Display #4: `com.bethsoft.falloutcompanionapp/com.unity3d.player.UnityPlayerNativeActivity`
+- No live `com.moonbench.thorlaunch` process after handoff
+
+When `launch automatically next time onwards` is checked, later wrapper starts
+are headless: the app verifies all checks and launches the two targets without
+drawing the wizard, showing itself again only if a prerequisite fails. Manual
+launches with that box unchecked prime both Thor stick LEDs to green at roughly
+30% brightness before handoff.
 
 ## In-game setup
 
@@ -163,6 +215,7 @@ Strip-Boy/
 │   ├── GAMENATIVE.md         install + Wine networking notes + troubleshooting
 │   ├── COPYRIGHT.md          interop scope (Sega v. Accolade, DMCA §1201(f))
 │   └── CHECKSUMS.md          known-good APK hash
+├── thor-launch-wrapper/      optional AYN Thor launcher APK source
 ├── apk/                      (gitignored — see apk/README.md)
 │   ├── original.apk          ← you supply
 │   ├── managed/              ← extracted + patched DLLs
@@ -202,6 +255,17 @@ grep 'return false' /tmp/check/SwrveSettings.cs /tmp/check/HockeyAppSettings.cs
   Studio's SDK Manager installs these)
 - `unzip` + `zip` (on Windows, the script uses `System.IO.Compression`,
   no external `zip` needed)
+- For `thor-launch-wrapper/`: JDK 17 and an Android SDK usable by Gradle
+
+## Attributions
+
+- Strip-Boy companion patch and Thor Launch Wrapper: Kuri
+  ([github/KuriGohan-Kamehameha](https://github.com/KuriGohan-Kamehameha)).
+- Bifrost: invented and maintained by Pollux, with plugin and project
+  contributions from Kuri.
+- Fallout, Pip-Boy, and related marks are owned by Bethesda / ZeniMax and are
+  referenced descriptively. This project is not affiliated with or endorsed by
+  Bethesda / ZeniMax.
 
 ## Legal
 
