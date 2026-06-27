@@ -232,6 +232,34 @@
     .param p2, "b"
 
     :try_start
+    # Strip the white wash before forwarding to Bifrost: subtract the min
+    # channel (full desaturation), then normalize the max channel to 255, so
+    # Bifrost receives a pure hue and its `intensity` knob sets brightness. The
+    # old verbatim forward sent the raw HUD colour, which on near-white tints lit
+    # the sticks mostly white. Skip normalize if max==0 (pure grey/white →
+    # (0,0,0); Bifrost's greenIfUnset then takes over). Mirrors the sysfs path's
+    # subtract-min step, which this branch previously skipped.
+    invoke-static {p0, p1}, Ljava/lang/Math;->min(II)I
+    move-result v0
+    invoke-static {v0, p2}, Ljava/lang/Math;->min(II)I
+    move-result v0
+    sub-int/2addr p0, v0
+    sub-int/2addr p1, v0
+    sub-int/2addr p2, v0
+    invoke-static {p0, p1}, Ljava/lang/Math;->max(II)I
+    move-result v0
+    invoke-static {v0, p2}, Ljava/lang/Math;->max(II)I
+    move-result v0
+    if-eqz v0, :desat_done
+    const/16 v1, 0xff
+    mul-int/2addr p0, v1
+    div-int/2addr p0, v0
+    mul-int/2addr p1, v1
+    div-int/2addr p1, v0
+    mul-int/2addr p2, v1
+    div-int/2addr p2, v0
+    :desat_done
+
     sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
     if-eqz v0, :done
 
@@ -260,11 +288,11 @@
 
     # color = 0xFF000000 | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
     # r/g/b (p0/p1/p2) are the live screen tint the patched
-    # PipboyPostEffect.SetColor hook just applied to the visible Pip-Boy
-    # (apply()'s arguments). Forward it verbatim so Bifrost's PIPBOY effect
-    # tracks the on-screen HUD colour instead of a frozen green — the sticks
-    # follow whatever colour the player has set. Bifrost's greenIfUnset still
-    # guards genuinely-unset (near-black boot/transition) frames.
+    # PipboyPostEffect.SetColor hook applied to the visible Pip-Boy, now
+    # desaturated + normalized above so Bifrost's PIPBOY effect tracks the HUD
+    # HUE (not the white-washed raw tint) — the sticks follow the player's
+    # colour at full saturation. Bifrost's greenIfUnset still guards
+    # genuinely-unset (near-black boot/transition) frames.
     const/high16 v5, -0x1000000      # 0xFF000000 alpha
     and-int/lit16 v6, p0, 0xff
     shl-int/lit8 v6, v6, 0x10        # (r & 0xFF) << 16
