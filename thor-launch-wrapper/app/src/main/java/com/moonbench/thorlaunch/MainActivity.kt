@@ -252,8 +252,12 @@ class MainActivity : AppCompatActivity() {
     private fun refocusCompanionOnBottomDisplay(state: WizardState) {
         val bottomDisplayId = findBottomDisplayId() ?: return
         val options = ActivityOptions.makeBasic().apply { setLaunchDisplayId(bottomDisplayId) }
-        val intent = Intent(Intent.ACTION_MAIN).apply {
-            setClassName(state.companionPackage, "com.unity3d.player.UnityPlayerNativeActivity")
+        // Re-issue through the companion's exported launcher (LauncherActivity),
+        // NOT UnityPlayerNativeActivity directly: the Unity activity is not
+        // exported, so a cross-uid startActivity on it throws SecurityException.
+        // The launcher's own redirect keeps Unity on the target display.
+        val intent = (packageManager.getLaunchIntentForPackage(state.companionPackage)
+            ?: return).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
         }
         runCatching { startActivity(intent, options.toBundle()) }
