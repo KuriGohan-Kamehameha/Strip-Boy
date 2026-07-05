@@ -36,6 +36,7 @@
     <string name="patch_locate_failed">Could not read the installed Pip-Boy APK to patch it.</string>
     <string name="patch_success_detail">Patched APK built — confirm the install prompt.</string>
     <string name="patch_install_failed">Patched APK built but the installer could not start. Enable "install unknown apps" for this launcher.</string>
+    <string name="patch_uninstall_needed">Uninstall the old Pip-Boy app when prompted, then re-run to install the patched one.</string>
     <string name="block_gamenative_missing">GameNative not found: %1$s</string>
     <string name="block_shortcut_missing">GameNative Fallout 4 GOG target not set for %1$s</string>
     <string name="block_bottom_display_missing">Thor bottom display not detected</string>

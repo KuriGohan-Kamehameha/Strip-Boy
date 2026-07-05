@@ -17,6 +17,7 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -67,6 +68,8 @@ class MainActivity : AppCompatActivity() {
     private var companionPatchInFlight = false
     private var companionPatchAttempted = false
     private var companionPatchDetail = ""
+    private var companionPatchPackage = DEFAULT_COMPANION_PACKAGE
+    private var pendingInstallApk: File? = null
     private var bootSequenceGeneration = 0
     private var bootControlsReady = false
     private var pendingAutoLaunch = false
@@ -874,6 +877,7 @@ class MainActivity : AppCompatActivity() {
         companionPatchDetail = getString(R.string.companion_patch_in_progress)
         statusView.text = getString(R.string.status_patching_companion)
         val companionPackage = state.companionPackage
+        companionPatchPackage = companionPackage
         Thread({ runCompanionPatch(companionPackage) }, "thorlaunch-companion-patch").start()
     }
 
@@ -902,16 +906,58 @@ class MainActivity : AppCompatActivity() {
             is PatchOutcome.Failed -> outcome.reason
         }
         if (outcome is PatchOutcome.Success) {
-            val installed = CompanionPatcher.installPatchedApk(this, outcome.patchedApk)
-            if (!installed) {
-                companionPatchDetail = getString(R.string.patch_install_failed)
-            }
+            installOrReplaceCompanion(outcome.patchedApk)
         }
         val state = collectState()
         statusView.text = state.blockingMessage
         renderInfoTable(state, animate = false)
         updateActionPanel(state)
         bottomPresentation?.updateState(state)
+    }
+
+    /**
+     * Install the freshly patched companion. The patched APK is signed with our
+     * own key, but the installed unpatched companion is signed with Bethesda's —
+     * installing over it is rejected as a signature mismatch. So if the package
+     * is still present, uninstall it first (system prompt) and finish the install
+     * from [onActivityResult]; otherwise install directly.
+     */
+    private fun installOrReplaceCompanion(apk: File) {
+        if (!isPackageInstalled(companionPatchPackage)) {
+            if (!CompanionPatcher.installPatchedApk(this, apk)) {
+                companionPatchDetail = getString(R.string.patch_install_failed)
+            }
+            return
+        }
+        pendingInstallApk = apk
+        val uninstall = Intent(Intent.ACTION_UNINSTALL_PACKAGE).apply {
+            data = Uri.parse("package:$companionPatchPackage")
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
+        }
+        val started = runCatching { startActivityForResult(uninstall, REQ_UNINSTALL_COMPANION) }
+            .onFailure { Log.w(TAG, "uninstall intent failed", it) }
+            .isSuccess
+        if (!started) {
+            pendingInstallApk = null
+            companionPatchDetail = getString(R.string.patch_install_failed)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_UNINSTALL_COMPANION) {
+            return
+        }
+        val apk = pendingInstallApk ?: return
+        pendingInstallApk = null
+        // Trust the observed state, not resultCode: proceed only once the old
+        // (mismatched-signature) package is actually gone.
+        if (isPackageInstalled(companionPatchPackage)) {
+            companionPatchDetail = getString(R.string.patch_uninstall_needed)
+        } else if (!CompanionPatcher.installPatchedApk(this, apk)) {
+            companionPatchDetail = getString(R.string.patch_install_failed)
+        }
+        refreshWizardState()
     }
 
     private fun queryBifrostPlugin(bifrostInstalled: Boolean) {
@@ -973,6 +1019,7 @@ class MainActivity : AppCompatActivity() {
         const val DEFAULT_COMPANION_PACKAGE = "com.bethsoft.falloutcompanionapp"
         const val COMPANION_LAUNCHER_ACTIVITY = "io.pipboy.thor.LauncherActivity"
         const val COMPANION_PATCH_DIR = "companion-patch"
+        const val REQ_UNINSTALL_COMPANION = 4201
         const val DEFAULT_BIFROST_PACKAGE = "com.moonbench.bifrost"
         const val BIFROST_RECEIVER_CLASS = "com.moonbench.bifrost.external.ExternalApiReceiver"
         const val BIFROST_PERMISSION = "com.moonbench.bifrost.permission.CONTROL_LEDS"
