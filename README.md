@@ -90,6 +90,69 @@ adb install -r apk/out/pipboy-loopback.apk
 
 Or sideload via the Android Files app from the APK file.
 
+### Thor Launch Wrapper and Bifrost plugin
+
+The APK on the [Strip-Boy releases page](https://github.com/KuriGohan-Kamehameha/Strip-Boy/releases)
+is the **Thor Launch Wrapper** (`com.moonbench.thorlaunch`), not the patched
+Bethesda companion (`com.bethsoft.falloutcompanionapp`). The desktop build above
+produces the companion; install that output separately. The wrapper's on-device
+patching flow instead needs your own installed original companion. Wrapper
+v0.7.4 fixes the uninstall/install signature-mismatch flow from v0.7.3.
+
+If the wrapper fails **“Pip-boy Bifrost plugin installed”**:
+
+1. Use the [Kuri-maintained Bifrost fork](https://github.com/KuriGohan-Kamehameha/Bifrost/releases),
+   with **Plugin Store and `ACTION_QUERY_PLUGIN` support** (available in
+   `v1.2.0-beta-7`). Upstream Pollux-MoonBench Bifrost **1.1.1** does not
+   provide this integration. Check the release notes, not just the version number.
+2. Open Bifrost's **Plugin Store** and download/install **Fallout 4 Pip-Boy**
+   (plugin ID `fallout4-pipboy`). It is a Bifrost LED animation bundle, not
+   another companion APK or a Fallout 4 game mod.
+3. Enable **Allow third-party LED control** in Bifrost → Settings → Behaviour,
+   keep Bifrost running, and retry the wrapper's checks.
+
+Before switching Bifrost distributions, export your presets/settings. If Android
+rejects the update because the signing keys differ, uninstall the old Bifrost
+before installing the fork; uninstalling erases its app data.
+
+The patched companion can be launched **directly without the wrapper or plugin**
+for gameplay. The wrapper's plugin prerequisite is for its LED integration, not
+the Fallout 4 companion protocol.
+
+### Black screen on launch
+
+A persistent black screen is **not** expected. A successful patch/signing log
+does not verify Unity's runtime or rendering on the device.
+
+- Check **both displays**: the patched companion normally opens on the Thor's
+  bottom screen. If Android rejects that launch, the launcher now logs the
+  failure and falls back to the default display.
+- Rebuild with `FORCE_RESTART=1 ./scripts/build.sh` to discard the cached
+  extraction, then reinstall `apk/out/pipboy-loopback.apk`. Use your own
+  **original v1.2 APK**, not a previously patched output, as input.
+- To separate a display-routing failure from a Unity startup failure, bypass
+  the launcher from ADB on the default display:
+
+  ```bash
+  adb shell am force-stop com.bethsoft.falloutcompanionapp
+  adb shell am start --display 0 -n com.bethsoft.falloutcompanionapp/com.unity3d.player.UnityPlayerNativeActivity
+  ```
+
+  This is an ADB diagnostic; the Unity activity is not exported for other apps.
+- If it stays black, capture logs while reproducing it:
+
+  ```bash
+  adb logcat -c
+  # Launch the companion, wait for the black screen, then:
+  adb logcat -d -v threadtime > pipboy-launch.log
+  adb shell getprop ro.product.cpu.abilist
+  ```
+
+  Include the Android/firmware version and whether direct/default-display
+  launch works. Review/redact the log before sharing it. The supplied build log
+  alone cannot establish the cause; a missing LED plugin is not evidence of a
+  Unity rendering failure.
+
 ## In-game setup
 
 Inside the Wine prefix that runs Fallout 4, edit
@@ -109,6 +172,15 @@ entry shows up — connect to it.
 
 Full GameNative path + troubleshooting in
 [`docs/GAMENATIVE.md`](docs/GAMENATIVE.md).
+
+**GameHub users:** GameNative is not required by the patched companion.
+GameHub can work if its game container exposes UDP `28000` discovery and TCP
+`27000` gameplay on the same Android network stack. Enable the companion in
+**GameHub's own Fallout 4 Wine prefix** using the settings above, load a save,
+keep the game running, and launch the patched companion directly. The released
+Thor Launch Wrapper targets GameNative's launch flow; that automation is not a
+claim of GameHub support. GameHub networking/background behaviour is unverified
+here, so isolated sockets or a paused game can still prevent connection.
 
 > **Silent NPC dialogue?** If Fallout 4 runs but characters' lips move with no
 > voice (music and cutscenes are fine), that's Wine's FAudio failing to decode
