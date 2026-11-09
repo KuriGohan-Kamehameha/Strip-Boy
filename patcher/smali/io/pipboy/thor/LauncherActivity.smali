@@ -82,6 +82,12 @@
     # v0.setFlags(v1)
     invoke-virtual {v0, v1}, Landroid/content/Intent;->setFlags(I)Landroid/content/Intent;
 
+    # setLaunchDisplayId requires Android 8.0 (API 26).
+    sget v1, Landroid/os/Build$VERSION;->SDK_INT:I
+    const/16 v2, 0x1a
+    if-lt v1, v2, :no_options
+
+    :display_try
     # v1 = (DisplayManager) this.getSystemService("display")
     const-string v1, "display"
 
@@ -90,6 +96,8 @@
     move-result-object v1
 
     check-cast v1, Landroid/hardware/display/DisplayManager;
+
+    if-eqz v1, :no_options
 
     # v2 = displayManager.getDisplays()
     invoke-virtual {v1}, Landroid/hardware/display/DisplayManager;->getDisplays()[Landroid/view/Display;
@@ -149,8 +157,16 @@
 
     # this.startActivity(v0, v1)
     invoke-virtual {p0, v0, v1}, Landroid/app/Activity;->startActivity(Landroid/content/Intent;Landroid/os/Bundle;)V
+    :display_end
+    .catch Ljava/lang/RuntimeException; {:display_try .. :display_end} :display_catch
 
     goto :done
+
+    :display_catch
+    move-exception v1
+    const-string v2, "strip-boy"
+    const-string v3, "Secondary-display launch failed; falling back to the default display"
+    invoke-static {v2, v3, v1}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
 
     :no_options
     # this.startActivity(v0)

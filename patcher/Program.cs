@@ -1002,7 +1002,8 @@ static class AutoPickLoopback
 static class RewriteNoConsoleFoundDesc
 {
     public const string NewMessage =
-        "GameNative must be running Fallout 4 on the top screen, in the foreground. " +
+        "Fallout 4 must be running with the Pip-Boy companion enabled and a save loaded. " +
+        "Keep your game launcher (e.g. GameNative or GameHub) running in the foreground. " +
         "Select the 127.0.0.1 entry; any other addresses can be ignored.";
 
     const string InterceptedKey = "$Companion_NoConsoleFoundDesc";
@@ -1837,4 +1838,3 @@ static class LEDStickBridge
           + $"{BridgeClassFqn}.apply (event-driven; no per-frame flicker sync)");
     }
 }
-
