@@ -119,10 +119,15 @@ object PatchAssembler {
     /** Edit the binary AndroidManifest of [apk] per patch_manifest.py; return AXML bytes. */
     fun editManifest(apk: File): ByteArray {
         val manifest = loadManifestBlock(apk)
-        patchLauncher(manifest)
-        patchBifrostIntegration(manifest)
+        patchManifest(manifest)
         manifest.refreshFull()
         return manifest.getBytes()
+    }
+
+    /** The stage-4 edits on an already-loaded manifest (unit-tested directly). */
+    internal fun patchManifest(manifest: AndroidManifestBlock) {
+        patchLauncher(manifest)
+        patchBifrostIntegration(manifest)
     }
 
     private fun loadManifestBlock(apk: File): AndroidManifestBlock {
@@ -135,12 +140,21 @@ object PatchAssembler {
 
     /**
      * 1. Strip MAIN/LAUNCHER/LEANBACK_LAUNCHER intent-filters from Unity's activity.
-     * 2. Add io.pipboy.thor.LauncherActivity (NoDisplay, exported, noHistory,
-     *    excludeFromRecents) with a MAIN+LAUNCHER+LEANBACK_LAUNCHER filter.
-     * Idempotent: no-op if LauncherActivity is already present.
+     * 2. Add io.pipboy.thor.LauncherActivity (NoDisplay, exported, noHistory)
+     *    with a MAIN+LAUNCHER+LEANBACK_LAUNCHER filter.
+     *
+     * LauncherActivity is not excluded from Recents: it roots the task the
+     * Unity activity joins, and Android applies the root's exclusion to the
+     * whole task, so the Pip-Boy had no Recents card to close. An existing
+     * LauncherActivity (patched by an older build) has the attribute removed;
+     * otherwise this is a no-op when LauncherActivity is already present.
      */
     private fun patchLauncher(manifest: AndroidManifestBlock) {
-        if (findActivity(manifest, LAUNCHER_FQN) != null) return
+        val existing = findActivity(manifest, LAUNCHER_FQN)
+        if (existing != null) {
+            existing.removeAttributesWithId(ID_EXCLUDE_FROM_RECENTS)
+            return
+        }
 
         val unity = findActivity(manifest, UNITY_FQN)
             ?: throw PatchStageException("manifest has no <activity> for $UNITY_FQN")
@@ -154,7 +168,6 @@ object PatchAssembler {
         setAndroidReference(launcher, AndroidManifest.ID_label, AndroidManifest.NAME_label, labelRef)
         setAndroidBoolean(launcher, AndroidManifest.ID_exported, AndroidManifest.NAME_exported, true)
         setAndroidBoolean(launcher, ID_NO_HISTORY, NAME_NO_HISTORY, true)
-        setAndroidBoolean(launcher, ID_EXCLUDE_FROM_RECENTS, NAME_EXCLUDE_FROM_RECENTS, true)
         addLauncherIntentFilter(launcher)
     }
 
@@ -401,11 +414,10 @@ object PatchAssembler {
         return if (isJks) "JKS" else "PKCS12"
     }
 
-    // ARSCLib's AndroidManifest exposes ID_/NAME_ for most attrs but not these two.
+    // ARSCLib's AndroidManifest exposes ID_/NAME_ for most attrs but not these.
     private const val ID_NO_HISTORY = 0x0101022d
     private const val NAME_NO_HISTORY = "noHistory"
     private const val ID_EXCLUDE_FROM_RECENTS = 0x01010017
-    private const val NAME_EXCLUDE_FROM_RECENTS = "excludeFromRecents"
     private const val TAG_QUERIES = "queries"
 
     /** Write [bytes] to [dest], creating parent dirs. Used by callers staging the helper dex. */

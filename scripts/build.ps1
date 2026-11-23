@@ -74,6 +74,14 @@ $PatcherProj   = "patcher\Patcher.csproj"
 $PatcherDll    = "patcher\bin\Release\net10.0\pipboy-patcher.dll"
 $LauncherSmali = "patcher\smali\io\pipboy\thor\LauncherActivity.smali"
 $LedBridgeSmali = "patcher\smali\io\pipboy\thor\LEDBridge.smali"
+$HelperSmali   = @(
+    $LauncherSmali,
+    $LedBridgeSmali,
+    "patcher\smali\io\pipboy\thor\LEDClear.smali",
+    "patcher\smali\io\pipboy\thor\CompanionLifecycle.smali",
+    "patcher\smali\io\pipboy\thor\GameWatch.smali",
+    "patcher\smali\io\pipboy\thor\CompanionExit.smali"
+)
 $ManifestXml   = Join-Path $ExtractedDir "AndroidManifest.xml"
 
 $ApkPath          = "assets/bin/Data/Managed/Assembly-CSharp.dll"
@@ -157,7 +165,7 @@ if ($LASTEXITCODE -ne 0) { Die "patch_manifest.py failed" }
 
 $smaliDst = Join-Path $ExtractedDir "smali\io\pipboy\thor"
 New-Item -ItemType Directory -Force -Path $smaliDst | Out-Null
-foreach ($src in @($LauncherSmali, $LedBridgeSmali)) {
+foreach ($src in $HelperSmali) {
     $name = Split-Path $src -Leaf
     $dst = Join-Path $smaliDst $name
     $copy = $true

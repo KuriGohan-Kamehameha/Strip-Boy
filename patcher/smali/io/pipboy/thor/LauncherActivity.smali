@@ -4,9 +4,15 @@
 
 
 # Thin launcher that re-launches UnityPlayerNativeActivity on the first
-# non-default Display. If there's no secondary display, it just launches
-# normally. This is how we ship the AYN Thor "always launch on the bottom
-# screen" behaviour without modifying any Unity code.
+# non-default presentation display (the AYN Thor bottom screen; the same
+# test the Thor Launch Wrapper uses). Virtual displays without
+# FLAG_PRESENTATION are skipped. With no such display, or when Android
+# rejects the display launch, it launches on the default display instead.
+# This is how we ship the AYN Thor "always launch on the bottom screen"
+# behaviour without modifying any Unity code.
+#
+# It also installs CompanionLifecycle, which pauses the LED keep-alive and
+# the game watch while the Pip-Boy is off screen.
 
 
 .method public constructor <init>()V
@@ -23,6 +29,9 @@
 
     # super.onCreate(savedInstanceState)
     invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
+
+    # Pause/resume/game-exit hooks for the Unity activity (once per process).
+    invoke-static {p0}, Lio/pipboy/thor/CompanionLifecycle;->register(Landroid/app/Activity;)V
 
     # --- default green LED state ---------------------------------------
     # Write a dim default-green payload to BOTH stick controllers
@@ -82,6 +91,12 @@
     # v0.setFlags(v1)
     invoke-virtual {v0, v1}, Landroid/content/Intent;->setFlags(I)Landroid/content/Intent;
 
+    # setLaunchDisplayId needs Android 8.0 (API 26).
+    sget v1, Landroid/os/Build$VERSION;->SDK_INT:I
+    const/16 v2, 0x1a
+    if-lt v1, v2, :no_options
+
+    :display_try
     # v1 = (DisplayManager) this.getSystemService("display")
     const-string v1, "display"
 
@@ -90,6 +105,8 @@
     move-result-object v1
 
     check-cast v1, Landroid/hardware/display/DisplayManager;
+
+    if-eqz v1, :no_options
 
     # v2 = displayManager.getDisplays()
     invoke-virtual {v1}, Landroid/hardware/display/DisplayManager;->getDisplays()[Landroid/view/Display;
@@ -102,7 +119,7 @@
     # v4 = 0             (loop index)
     const/4 v4, 0x0
 
-    # v5 = displays.length
+    # v5 = displays.length (the loop bound)
     array-length v5, v2
 
     :loop_start
@@ -116,6 +133,15 @@
 
     # if (displayId == 0) continue   (skip the DEFAULT_DISPLAY)
     if-eqz v7, :loop_continue
+
+    # if ((display.getFlags() & FLAG_PRESENTATION) == 0) continue
+    invoke-virtual {v6}, Landroid/view/Display;->getFlags()I
+
+    move-result v6
+
+    and-int/lit8 v6, v6, 0x8
+
+    if-eqz v6, :loop_continue
 
     # targetId = displayId; break
     move v3, v7
@@ -149,8 +175,19 @@
 
     # this.startActivity(v0, v1)
     invoke-virtual {p0, v0, v1}, Landroid/app/Activity;->startActivity(Landroid/content/Intent;Landroid/os/Bundle;)V
+    :display_end
+    .catch Ljava/lang/RuntimeException; {:display_try .. :display_end} :display_catch
 
     goto :done
+
+    :display_catch
+    # Android refused the bottom-screen launch (e.g. SecurityException):
+    # log it and fall back to the default display rather than finishing
+    # with nothing started.
+    move-exception v1
+    const-string v2, "strip-boy"
+    const-string v3, "bottom-screen launch failed; using the default display"
+    invoke-static {v2, v3, v1}, Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
 
     :no_options
     # this.startActivity(v0)
