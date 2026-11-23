@@ -76,7 +76,7 @@ tasks.withType<Test>().configureEach {
 }
 
 // ---------------------------------------------------------------------------
-// Stage-3 prebuild: assemble the three io.pipboy.thor.* helper smali sources
+// Stage-3 prebuild: assemble the io.pipboy.thor.* helper smali sources
 // into a single helper.dex shipped as an app asset. These are Kuri's own
 // classes (no Bethesda bytes); on-device they are injected as the next free
 // classesN.dex. Build-time only — smali never ships in the APK.
@@ -119,7 +119,10 @@ val buildHelperDex by tasks.registering(BuildHelperDexTask::class) {
     description = "Assemble io.pipboy.thor.* smali into helper.dex (stage-3 asset)."
     classpath = smaliTool
     smaliSources.from(
-        listOf("LauncherActivity.smali", "LEDBridge.smali", "LEDClear.smali")
+        listOf(
+            "LauncherActivity.smali", "LEDBridge.smali", "LEDClear.smali",
+            "CompanionLifecycle.smali", "GameWatch.smali", "CompanionExit.smali"
+        )
             .map { File(smaliSrcDir, it) }
     )
     outputDir.set(layout.buildDirectory.dir("generated/helper-dex"))

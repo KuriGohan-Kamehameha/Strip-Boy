@@ -91,7 +91,15 @@
 # heartbeat re-sends ACTION_DISPLAY every 2s so Bifrost's lease watchdog
 # keeps the override alive; when this process dies the loop stops and
 # Bifrost cleanly reverts.
-.field private static heartbeatStarted:Z
+.field private static volatile heartbeatStarted:Z
+
+# True while the Unity activity is paused (off screen, covered, or the
+# screen is off). Set by suspendKeepAlive()/resumeKeepAlive(), called from
+# CompanionLifecycle on the UI thread; read by apply() on the Unity thread and
+# by run() on the LED thread. While set, nothing is sent to Bifrost and the
+# heartbeat chain ends, so Bifrost drops the PIPBOY override and stops
+# rendering for us.
+.field private static volatile suspended:Z
 
 .method static constructor <clinit>()V
     .registers 5
@@ -134,12 +142,15 @@
 # background writer. Coalesces queued posts so the writer always
 # operates on the latest values.
 .method public static apply(IIIF)V
-    .registers 7
+    .locals 4
     .param p0, "r"
     .param p1, "g"
     .param p2, "b"
     .param p3, "fBrightness"
 
+    # Locals are v0-v3 only. The parameters live above them, so p1/p2 are
+    # never reused as scratch (an earlier version reused them and sent
+    # g=2, b=2 on every immediate broadcast).
     sput p0, Lio/pipboy/thor/LEDBridge;->pendingR:I
     sput p1, Lio/pipboy/thor/LEDBridge;->pendingG:I
     sput p2, Lio/pipboy/thor/LEDBridge;->pendingB:I
@@ -150,31 +161,40 @@
     move-result-wide v0
     sput-wide v0, Lio/pipboy/thor/LEDBridge;->pendingFBWall:J
 
+    # Pause/resume hooks (idempotent). Covers a start from Recents that
+    # re-creates the Unity activity without running LauncherActivity.
+    sget-object v0, Lcom/unity3d/player/UnityPlayer;->currentActivity:Landroid/app/Activity;
+    invoke-static {v0}, Lio/pipboy/thor/CompanionLifecycle;->register(Landroid/app/Activity;)V
+
     # Lazy-detect whether Bifrost is installed; cache the verdict.
-    sget v4, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
-    if-nez v4, :have_mode
+    sget v2, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    if-nez v2, :have_mode
     invoke-static {}, Lio/pipboy/thor/LEDBridge;->detectDispatchMode()I
-    move-result v4
-    sput v4, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    move-result v2
+    sput v2, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
 
     :have_mode
-    const/4 v5, 0x2
-    if-ne v4, v5, :sysfs_path
+    const/4 v3, 0x2
+    if-ne v2, v3, :sysfs_path
+
+    # Off screen: keep the colour for resumeKeepAlive(), send nothing.
+    sget-boolean v3, Lio/pipboy/thor/LEDBridge;->suspended:Z
+    if-nez v3, :done
 
     # Bifrost path — immediate ACTION_DISPLAY broadcast for responsiveness...
     invoke-static {p0, p1, p2}, Lio/pipboy/thor/LEDBridge;->sendBifrostDisplay(III)V
 
     # ...and ensure the keep-alive heartbeat loop is running (start once).
-    sget-boolean v4, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
-    if-nez v4, :hb_running
-    const/4 v4, 0x1
-    sput-boolean v4, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    sget-boolean v3, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    if-nez v3, :done
+    const/4 v3, 0x1
+    sput-boolean v3, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
     sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
     sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
     const-wide/16 v2, 0x1f4      # 500ms heartbeat interval (tighter re-anchor)
     invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
 
-    :hb_running
+    :done
     return-void
 
     :sysfs_path
@@ -183,6 +203,64 @@
     invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
     invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
 
+    return-void
+.end method
+
+
+# Pip-Boy off screen (CompanionLifecycle, UI thread). Ends the heartbeat and
+# clears the Bifrost override. The clear is posted to the LED thread so it
+# lands after any heartbeat tick already in flight; that tick re-posts
+# itself, sees `suspended`, and stops.
+.method public static suspendKeepAlive()V
+    .locals 2
+
+    const/4 v0, 0x1
+    sput-boolean v0, Lio/pipboy/thor/LEDBridge;->suspended:Z
+    const/4 v0, 0x0
+    sput-boolean v0, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+
+    sget v0, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    const/4 v1, 0x2
+    if-ne v0, v1, :done
+
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    new-instance v1, Lio/pipboy/thor/LEDClear;
+    invoke-direct {v1}, Lio/pipboy/thor/LEDClear;-><init>()V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    :done
+    return-void
+.end method
+
+
+# Pip-Boy back on screen (CompanionLifecycle, UI thread). Re-sends the last
+# colour now and restarts the heartbeat. Nothing to renew before the first
+# colour has arrived (pendingFBWall == 0).
+.method public static resumeKeepAlive()V
+    .locals 4
+
+    const/4 v0, 0x0
+    sput-boolean v0, Lio/pipboy/thor/LEDBridge;->suspended:Z
+
+    sget v0, Lio/pipboy/thor/LEDBridge;->dispatchMode:I
+    const/4 v1, 0x2
+    if-ne v0, v1, :done
+
+    sget-wide v0, Lio/pipboy/thor/LEDBridge;->pendingFBWall:J
+    const-wide/16 v2, 0x0
+    cmp-long v0, v0, v2
+    if-eqz v0, :done
+
+    const/4 v0, 0x1
+    sput-boolean v0, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
+    sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->post(Ljava/lang/Runnable;)Z
+
+    :done
     return-void
 .end method
 
@@ -450,15 +528,31 @@
     const/4 v1, 0x2
     if-ne v0, v1, :sysfs_writer
 
+    # Pip-Boy off screen: end the chain here (suspendKeepAlive cleared).
+    sget-boolean v0, Lio/pipboy/thor/LEDBridge;->suspended:Z
+    if-eqz v0, :hb_send
+    const/4 v0, 0x0
+    sput-boolean v0, Lio/pipboy/thor/LEDBridge;->heartbeatStarted:Z
+    return-void
+
+    :hb_send
     sget v0, Lio/pipboy/thor/LEDBridge;->pendingR:I
     sget v1, Lio/pipboy/thor/LEDBridge;->pendingG:I
     sget v2, Lio/pipboy/thor/LEDBridge;->pendingB:I
     invoke-static {v0, v1, v2}, Lio/pipboy/thor/LEDBridge;->sendBifrostDisplay(III)V
 
+    # One chain only. If another tick is already queued (resume, flicker
+    # toggle, burst), it carries the chain on; scheduling a second would
+    # double the broadcast rate for the rest of the session. Bifrost mode
+    # implies API 33+, so Handler.hasCallbacks (API 29) is present.
     sget-object v0, Lio/pipboy/thor/LEDBridge;->handler:Landroid/os/Handler;
     sget-object v1, Lio/pipboy/thor/LEDBridge;->writer:Ljava/lang/Runnable;
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->hasCallbacks(Ljava/lang/Runnable;)Z
+    move-result v2
+    if-nez v2, :hb_done
     const-wide/16 v2, 0x1f4      # 500ms (tighter re-anchor for PIPBOY sync)
     invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
+    :hb_done
     return-void
 
     :sysfs_writer

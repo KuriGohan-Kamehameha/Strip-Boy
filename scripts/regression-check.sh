@@ -70,6 +70,16 @@ CLEAR_SMALI="patcher/smali/io/pipboy/thor/LEDClear.smali"
 if grep -q 'onDeactivate()V' "$CLEAR_SMALI" 2>/dev/null; then note "ok: smali onDeactivate()V present (LEDClear)"
 else note "FAIL: smali method 'onDeactivate()V' missing from LEDClear.smali"; fail=1; fi
 
+# 6. Pause/resume/game-exit helpers that LauncherActivity and LEDBridge call.
+for pair in 'CompanionLifecycle:register(Landroid/app/Activity;)V' \
+            'CompanionLifecycle:onActivityPaused(Landroid/app/Activity;)V' \
+            'LEDBridge:suspendKeepAlive()V' 'LEDBridge:resumeKeepAlive()V' \
+            'GameWatch:onShown()V' 'GameWatch:onHidden()V' 'CompanionExit:request()V'; do
+    cls="${pair%%:*}"; m="${pair#*:}"
+    if grep -q "$m" "patcher/smali/io/pipboy/thor/$cls.smali" 2>/dev/null; then note "ok: smali $cls.$m present"
+    else note "FAIL: smali method '$m' missing from $cls.smali"; fail=1; fi
+done
+
 rm -f /tmp/regr-patched.dll
 if [ "$fail" = 0 ]; then echo "[regr] PASS — all patcher behaviour guarded"; else
     echo "[regr] FAIL — see above" >&2; exit 1; fi

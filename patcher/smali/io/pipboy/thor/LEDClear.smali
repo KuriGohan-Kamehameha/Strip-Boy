@@ -1,5 +1,6 @@
 .class public Lio/pipboy/thor/LEDClear;
 .super Ljava/lang/Object;
+.implements Ljava/lang/Runnable;
 
 # Proactive deactivation signal for Bifrost.
 #
@@ -13,6 +14,9 @@
 # Mirrors LEDBridge.sendPulse's broadcast plumbing; no extras — Bifrost
 # resolves the caller package from our UID, so an empty ACTION_CLEAR to the
 # override owner is sufficient. Self-guarded: any failure is swallowed.
+#
+# Also a Runnable: LEDBridge.suspendKeepAlive posts an instance to the LED
+# thread so the clear is sent after any heartbeat tick already in flight.
 
 .method public constructor <init>()V
     .registers 1
@@ -47,5 +51,12 @@
 
     :catch
     move-exception v0
+    return-void
+.end method
+
+
+.method public run()V
+    .registers 1
+    invoke-static {}, Lio/pipboy/thor/LEDClear;->onDeactivate()V
     return-void
 .end method

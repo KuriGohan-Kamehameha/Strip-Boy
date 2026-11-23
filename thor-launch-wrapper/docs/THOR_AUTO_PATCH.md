@@ -178,7 +178,7 @@ Output: an `ELF aarch64` `pipboy-patcher`. It ships in the wrapper at
 |-------|-----------|--------|
 | 1. Extract `Assembly-CSharp.dll` | `java.util.zip` from the companion APK | **done** |
 | 2. IL patch | exec bundled `libpipboy-patcher.so` via `ProcessBuilder` | **done + binary bundled** (packaged in APK; on-device exec is device-gated) |
-| 3. smali helper inject | a prebuilt helper `.dex` (assembled from `patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear}.smali` — Kuri's own code, no Bethesda bytes — by the `buildHelperDex` gradle task), shipped as `app/src/main/assets/helper.dex`, injected on-device as the next free `classesN.dex` (NOT merged into `classes.dex`; ART API 33 loads all `classesN.dex`) | **done** (DRAFT, off-device validated) |
+| 3. smali helper inject | a prebuilt helper `.dex` (assembled from `patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear,CompanionLifecycle,GameWatch,CompanionExit}.smali` — Kuri's own code, no Bethesda bytes — by the `buildHelperDex` gradle task), shipped as `app/src/main/assets/helper.dex`, injected on-device as the next free `classesN.dex` (NOT merged into `classes.dex`; ART API 33 loads all `classesN.dex`) | **done** (DRAFT, off-device validated) |
 | 4. manifest intent-filter move | pure-Java binary-AXML edit via ARSCLib (`io.github.reandroid:ARSCLib`); resolves `@string/app_name` against `resources.arsc` and writes `@android:style/Theme.NoDisplay` = `0x01030055`. Same edits as `scripts/patch_manifest.py` | **done** (DRAFT, off-device validated) |
 | 5. repackage + zipalign + sign | rebuild the zip (patched DLL + edited manifest + injected dex, stale `META-INF` signatures dropped, `STORED` entries preserved for alignment), then sign + align with `com.android.tools.build:apksig` (`setAlignFileSize(true)`) using a key in app storage | **done** (DRAFT, off-device validated) |
 | 6. install | `PackageInstaller` / `ACTION_VIEW` (already wired in `CompanionPatcher`) | **done** |
@@ -206,7 +206,7 @@ The gradle task `:app:buildHelperDex` assembles the three smali sources into
 #   java -cp <com.android.tools.smali:smali:3.0.9 + deps> \
 #     com.android.tools.smali.smali.Main assemble --api 33 \
 #     --output build/generated/helper-dex/helper.dex \
-#     patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear}.smali
+#     patcher/smali/io/pipboy/thor/{LauncherActivity,LEDBridge,LEDClear,CompanionLifecycle,GameWatch,CompanionExit}.smali
 ```
 
 smali runs only at build time (the `smaliTool` configuration) — it never ships
@@ -241,6 +241,10 @@ task (stage-3 asset), then exercises the SAME `PatchAssembler` code via the
 - `dexdump` across the dex set → `Lio/pipboy/thor/{LauncherActivity,LEDBridge,
   LEDClear};` present (in the injected `classes2.dex`).
 - `sha256` of in-APK `Assembly-CSharp.dll` == the stage-2 patched DLL.
+
+(Recorded before v0.7.5. Since then `LauncherActivity` carries no
+`excludeFromRecents`, so the Pip-Boy task shows in Recents, and the helper dex
+has six classes; `verify_ondevice_stages.sh` checks for all six.)
 
 Idempotence is asserted too: re-patching an already-patched APK yields exactly
 one `LauncherActivity` and re-verifies.

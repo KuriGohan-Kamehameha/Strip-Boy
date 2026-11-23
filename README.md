@@ -179,6 +179,74 @@ Full GameNative path + troubleshooting in
 > is written up in
 > [`docs/GAMENATIVE.md` §8](docs/GAMENATIVE.md#8-no-npc-dialogue-the-xwma-voice-fix).
 
+## Closing the companion
+
+- The patched Pip-Boy has a normal Recents card (it used to be hidden, so it
+  could not be swiped away). Close it there like any other app.
+- While the Pip-Boy is off screen (covered by another app, sent home, or the
+  screen is off) it stops renewing its Bifrost LED override and releases the
+  sticks. It picks the override up again when it comes back on screen.
+- Once Fallout 4 has answered the loopback discovery request at least once,
+  the companion keeps asking every 5 s while it is on screen. After 24 missed
+  answers in a row (about two minutes) it closes itself. A game on another
+  machine, or a launcher without loopback networking, never arms this.
+
+These behaviours live in the patch, so an already-patched Pip-Boy keeps the
+old behaviour until it is patched again from the original v1.2 APK:
+
+- **On-device (Thor Launch Wrapper):** install the new wrapper, uninstall the
+  Pip-Boy app, reinstall *Fallout 4 Pip-Boy* from Google Play, open the
+  wrapper and let it patch.
+- **Desktop:** run `./scripts/build.sh` against your original APK (a cached
+  `apk/extracted/` tree is updated in place), then
+  `adb install -r apk/out/pipboy-loopback.apk`.
+
+## Bifrost plugin and LED control
+
+The wrapper's "Pip-boy Bifrost plugin installed" check needs the
+[Kuri-maintained Bifrost](https://github.com/KuriGohan-Kamehameha/Bifrost/releases)
+(upstream Pollux-MoonBench 1.1.1 has no Plugin Store). In Bifrost's settings
+turn on **Allow third-party LED control**, then **Open Plugin Store** and
+install **Fallout 4 Pip-Boy** (`fallout4-pipboy`). It is a Bifrost LED bundle,
+not another APK or a game mod. The patched companion itself works without
+Bifrost or the plugin; they only drive the stick LEDs.
+
+If Android refuses to update Bifrost because the signatures differ, export
+your presets first: uninstalling the old Bifrost erases its data.
+
+## Black screen on launch
+
+The launcher puts the companion on the first presentation display (the Thor's
+bottom screen) and falls back to the default display if there is none or if
+Android rejects that launch. If the companion stays black:
+
+1. Check both screens.
+2. Rebuild from your original v1.2 APK (never a previously patched one) with
+   `FORCE_RESTART=1 ./scripts/build.sh`, then reinstall.
+3. Start Unity directly on the default display to separate a display problem
+   from a Unity start-up problem:
+
+   ```bash
+   adb shell am force-stop com.bethsoft.falloutcompanionapp
+   adb shell am start --display 0 -n com.bethsoft.falloutcompanionapp/com.unity3d.player.UnityPlayerNativeActivity
+   ```
+
+4. If it is still black, capture a log while reproducing it and attach it to
+   an issue with your device and Android version:
+
+   ```bash
+   adb logcat -c
+   # launch the companion, wait for the black screen, then:
+   adb logcat -d -v threadtime > pipboy-launch.log
+   ```
+
+**GameHub instead of GameNative:** the patched companion does not depend on
+GameNative. It needs Fallout 4's UDP `28000` discovery and TCP `27000`
+gameplay ports reachable on the device's loopback, so enable the companion in
+the Fallout 4 prefix GameHub uses and launch the patched companion directly.
+The Thor Launch Wrapper only automates GameNative. GameHub networking is not
+verified here.
+
 ## Airplane-mode safety
 
 After patches 2, 3, and 5, the only sockets the app opens are:
@@ -187,6 +255,8 @@ After patches 2, 3, and 5, the only sockets the app opens are:
   LAN interface)
 - `UDP unicast → 127.0.0.1:28000` — loopback autodiscover (patch #1)
 - `TCP → <selected device>:27000` — gameplay channel (loopback or LAN)
+- `UDP unicast → 127.0.0.1:28000` every 5 s while on screen — the game-exit
+  watch (see "Closing the companion")
 
 If the selected device is `127.0.0.1`, **the app stays entirely on
 loopback** and works in airplane mode even with WiFi off. Both the

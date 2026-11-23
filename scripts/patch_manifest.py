@@ -7,6 +7,11 @@ activity, strips the launcher intent-filter from UnityPlayerNativeActivity,
 so taps on the launcher icon route through our display-redirecting
 LauncherActivity first.
 
+LauncherActivity is NOT excluded from Recents: it is the root of the task
+the Unity activity runs in, and Android applies the root's exclusion to the
+whole task, which left the Pip-Boy with no Recents card to close. A manifest
+patched by an older version has that attribute removed on the next run.
+
 Run with the path to the decoded AndroidManifest.xml as the argument:
 
     python3 patch_manifest.py path/to/extracted/AndroidManifest.xml
@@ -41,6 +46,7 @@ def main(path: str) -> int:
         print(f"skip: {LAUNCHER_FQN} already present in manifest")
     else:
         _patch_launcher(app)
+    _keep_launcher_task_in_recents(app)
 
     _patch_bifrost_integration(root)
 
@@ -75,14 +81,14 @@ def _patch_launcher(app):
             unity_activity.remove(filt)
             removed += 1
 
-    # 2. Insert our LauncherActivity. Translucent + noHistory so it never paints.
+    # 2. Insert our LauncherActivity. NoDisplay + noHistory so it never paints.
+    #    No excludeFromRecents: see _keep_launcher_task_in_recents.
     launcher = ET.SubElement(app, "activity")
     launcher.set(NAME_ATTR, LAUNCHER_FQN)
     launcher.set(f"{{{ANDROID_NS}}}exported", "true")
     launcher.set(f"{{{ANDROID_NS}}}label", "@string/app_name")
     launcher.set(f"{{{ANDROID_NS}}}theme", "@android:style/Theme.NoDisplay")
     launcher.set(f"{{{ANDROID_NS}}}noHistory", "true")
-    launcher.set(f"{{{ANDROID_NS}}}excludeFromRecents", "true")
 
     filt = ET.SubElement(launcher, "intent-filter")
     action = ET.SubElement(filt, "action")
@@ -93,6 +99,15 @@ def _patch_launcher(app):
     cat2.set(NAME_ATTR, "android.intent.category.LEANBACK_LAUNCHER")
 
     print(f"patched: stripped {removed} launcher intent-filter(s) from {UNITY_FQN}, added {LAUNCHER_FQN}")
+
+
+def _keep_launcher_task_in_recents(app):
+    """Drop excludeFromRecents from LauncherActivity (set by older versions)."""
+    attr = f"{{{ANDROID_NS}}}excludeFromRecents"
+    for activity in app.findall("activity"):
+        if activity.get(NAME_ATTR) == LAUNCHER_FQN and activity.get(attr) is not None:
+            del activity.attrib[attr]
+            print(f"patched: {LAUNCHER_FQN} no longer excluded from Recents")
 
 
 def _patch_bifrost_integration(root):

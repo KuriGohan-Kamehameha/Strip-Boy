@@ -13,8 +13,10 @@
 # Checks (all must pass):
 #   1. apksigner verify          → the produced APK is validly signed.
 #   2. aapt2 dump xmltree diff    → manifest edits match the reference.
-#   3. dexdump                    → io.pipboy.thor.{LauncherActivity,LEDBridge,
-#                                   LEDClear} are present in the dex set.
+#   3. dexdump                    → the six io.pipboy.thor.* helper classes
+#                                   (LauncherActivity, LEDBridge, LEDClear,
+#                                   CompanionLifecycle, GameWatch, CompanionExit)
+#                                   are present in the dex set.
 #   4. sha256                     → in-APK Assembly-CSharp.dll == patched DLL.
 #
 # Final install + on-device launch is corporeality-gated (needs the AYN Thor).
@@ -130,9 +132,9 @@ if diff "$SCRATCH/ref.txt" "$SCRATCH/mine.txt"; then echo "PASS — manifest mat
 echo; echo "########## 3. helper dex class presence ##########"
 mkdir -p "$SCRATCH/dex"; ( cd "$SCRATCH/dex" && unzip -o -q "$OUT_APK" 'classes*.dex' )
 found="$(for d in "$SCRATCH"/dex/classes*.dex; do "$DEXDUMP" "$d" 2>/dev/null; done \
-    | grep -oE 'Lio/pipboy/thor/(LauncherActivity|LEDBridge|LEDClear);' | sort -u)"
+    | grep -oE 'Lio/pipboy/thor/(LauncherActivity|LEDBridge|LEDClear|CompanionLifecycle|GameWatch|CompanionExit);' | sort -u)"
 echo "$found"
-if [ "$(echo "$found" | wc -l | tr -d ' ')" = "3" ]; then echo "PASS — 3 helper classes present"; else echo "FAIL"; fail=1; fi
+if [ "$(echo "$found" | wc -l | tr -d ' ')" = "6" ]; then echo "PASS — 6 helper classes present"; else echo "FAIL"; fail=1; fi
 
 echo; echo "########## 4. Assembly-CSharp.dll sha match ##########"
 in_apk_sha="$(unzip -p "$OUT_APK" 'assets/bin/Data/Managed/Assembly-CSharp.dll' | shasum -a 256 | awk '{print $1}')"
